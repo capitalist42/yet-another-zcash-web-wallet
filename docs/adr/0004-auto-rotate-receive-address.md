@@ -1,0 +1,3 @@
+# Auto-rotate the Receive Address after an observed receive
+
+The Receive screen advances to a fresh Exposed Address as soon as sync observes an incoming transfer landing on the displayed one. Chosen over pin-until-manual-rotate because address reuse is the mainchain privacy leak our users will not think to avoid, and v1's audience won't proactively rotate. Consequences accepted: an address handed to a slow payer goes stale — it still works forever (the viewing key sees all exposed addresses) but is no longer displayed, so the Exposed Address list is mandatory UI; rotation triggers only on incoming transfers, never on self-change or shielding.

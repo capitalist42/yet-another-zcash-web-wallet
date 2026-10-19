@@ -1,0 +1,3 @@
+# One storage database per Wallet, app-side registry
+
+`zcash.js` supports multiple accounts inside one SQLite DB, but each Wallet gets its own OPFS DB (`yaw-<network>-<id>`) with an app-side IndexedDB registry (id, name, fingerprint, kind, lastUsed) driving startup ("last used per network"), and exactly one open Wallet per network. DB-per-Wallet makes "Forget Wallet" a clean recursive directory delete after `close()` — the SDK exposes no wipe API and OPFS access handles are exclusive, so deletion is only provable when a DB has exactly one owner — and guarantees no state bleeds between Wallets. Cost: switching is close+reopen, and any cross-Wallet aggregate view ("total across wallets") is app-side, not queryable.
