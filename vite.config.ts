@@ -2,8 +2,7 @@ import { defineConfig, type Connect } from 'vite';
 import react from '@vitejs/plugin-react';
 import { createServer } from 'node:http';
 import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
-import type { IncomingMessage, ServerResponse, Server } from 'node:http';
-
+import type { IncomingMessage, ServerResponse } from 'node:http';
 // Ticket #2 spike config. Plan §1: no inlined assets (engine ships WASM, workers,
 // proving params as real files). The S4 drill proxy and COOP/COEP headers exist
 // only to qualify SUBMISSION_UNKNOWN and the threaded runtime; product config
@@ -85,7 +84,7 @@ function createProxyServer() {
 }
 
 function hangProxy() {
-  const attach = (middlewares: Connect.Server, httpServer: Server | null | undefined) => {
+  const attach = (middlewares: Connect.Server, httpServer: { once(event: 'close', listener: () => void): unknown } | null | undefined) => {
     middlewares.use(toggleMiddleware());
     const proxy = createProxyServer();
     const bind = () => {
