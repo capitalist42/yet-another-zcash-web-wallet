@@ -17,7 +17,12 @@ import { wordlist } from '@scure/bip39/wordlists/english';
 
 export const TESTNET_ENDPOINT = 'https://zcash-testnet.chainsafe.dev';
 export const MAINNET_ENDPOINT = 'https://zcash-mainnet.chainsafe.dev';
-export const FAUCET_ORIGIN = 'https://zcashfaucet.jinolabs.xyz';
+// Testnet-only drip source: the valargroup/zakura NU7-aware public-testnet
+// faucet (0.125 TAZ; POST /api/claim, GET /api/status). The previous source
+// (zcashfaucet.jinolabs.xyz) stopped paying at NU7 activation 2026-10-04.
+// Relative path: the API sends no CORS headers, so the page goes through the
+// dev/preview server's /faucet-api proxy (see vite.config.ts).
+export const FAUCET_API = '/faucet-api';
 
 // Live-qualification run target. Testnet is NU7 since 2026-10-04 (height
 // 4,465,026; branch 77190ad9) and rc.5's codec stops at Nu6_3 (37a5165b), so
@@ -33,7 +38,7 @@ export type TransparentMode = 'disallow' | 'allow-owned';
 
 export type StepName =
   | 'S1a-create-A'
-  | 'S1b-current-null'
+  | 'S1b-current-probe'
   | 'S1c-next-mints'
   | 'S1d-sync-tip'
   | 'FAUCET-t'
@@ -77,6 +82,9 @@ export const errorShape = (e: unknown): ErrorShape =>
     ? { code: e.code, stage: e.stage, recovery: e.recovery, retryable: e.retryable, message: e.message }
     : { message: e instanceof Error ? e.message : String(e) };
 
+// SDK floor for transparent UTXOs to become shieldable; skipIfUnfunded and
+// the P2/P3 inline gates must use the SAME bar (frozenPolicy below).
+export const SHIELDING_THRESHOLD = 10_000n;
 const CONFIRMATIONS = { trusted: 1, untrusted: 1, allowZeroConfirmationShielding: false };
 
 // Frozen policy per plan §2; the one experiment axis (transparent) swaps per phase.
@@ -88,7 +96,7 @@ export const frozenPolicy = (transparent: TransparentMode): TransactionPolicy =>
   confirmations: CONFIRMATIONS,
   expiry: { kind: 'offset', blocks: 5 },
   lockExpiryBlocks: 20,
-  shieldingThreshold: 10_000n,
+  shieldingThreshold: SHIELDING_THRESHOLD,
   freshness: { mode: 'catch-up', maxLagBlocks: 10, timeoutMs: 30_000 },
 });
 
@@ -122,7 +130,7 @@ export async function openWallet(
 // Live mainnet produces blocks every ~75 s; enhancement's tip-vs-retained-point
 // read races them (enhancement.js unspent()). Both throw codes documented as
 // retry-via-sync (errors-lifecycle.md: CURSOR_STALE / RECOVERY_REQUIRED).
-const delay = (ms: number): Promise<void> => {
+export const delay = (ms: number): Promise<void> => {
   const { promise, resolve } = Promise.withResolvers<void>();
   setTimeout(resolve, ms);
   return promise;

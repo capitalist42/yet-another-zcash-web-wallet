@@ -13,16 +13,14 @@ import {
   isResyncGuided,
   syncTolerant,
   RUN_NETWORK,
+  SHIELDING_THRESHOLD,
+  delay,
+  FAUCET_API,
 } from './core';
 import type { Ctx, StepName, TransparentMode } from './core';
-import type { AccountId, AccountRecord, AddressRecord, MemorySigner, SyncStatus, WalletClient } from '@zcashlabs/zcash.js';
+import type { AccountId, AccountRecord, AddressRecord, MemorySigner, PaymentConfirmation, SyncStatus, WalletClient } from '@zcashlabs/zcash.js';
 import { accountIndex, isZcashError, resolveBirthday } from '@zcashlabs/zcash.js';
 
-const delay = (ms: number): Promise<void> => {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-};
 
 // ---- S1: create / address semantics / sync --------------------------------
 
@@ -49,14 +47,17 @@ export const step1a_createA = async (ctx: Ctx, transparent: TransparentMode = 'd
   }
 };
 
+// S1b: `addresses.current()` probe on the fresh account. The spec claim
+// (rc.5 docs: null on fresh) is DISPROVEN live — create() already exposes
+// index 0 (plan §0). Step renamed from "current-null" so PASS/FAIL is not
+// inverted: PASS = probe ran and behavior recorded; the null-vs-not-null
+// fact rides in the detail, and a FAIL means the probe itself broke.
 export const step1b_currentNull = async (ctx: Ctx): Promise<void> => {
   try {
     const current = await clientA(ctx).addresses.current({ accountId: requireAccountA(ctx) });
-    // Finding (live mainnet, both fresh accounts): create() itself exposes
-    // index 0, so current() is NOT null after create. Recorded, not gated.
-    record(ctx, 'S1b-current-null', true, `current() on fresh account = ${current === null ? 'null' : `NOT NULL (${current.slice(0, 8)}…)`}`);
+    record(ctx, 'S1b-current-probe', true, `current() on fresh account = ${current === null ? 'null' : `NOT NULL (${current.slice(0, 8)}…)`}`);
   } catch (e) {
-    record(ctx, 'S1b-current-null', false, JSON.stringify(errorShape(e)));
+    record(ctx, 'S1b-current-probe', false, JSON.stringify(errorShape(e)));
   }
 };
 
@@ -105,73 +106,56 @@ export const step1d_syncTip = async (ctx: Ctx): Promise<void> => {
   }
 };
 
-// ---- Faucet: browser-PoW claim against the transparent receiver -----------
+// ---- Faucet: drip claim against the transparent receiver ------------------
 
-interface PowChallenge {
-  ok: boolean;
-  seed: string;
-  difficulty: number;
-  exp: number;
-  sig: string;
+// Valargroup NU7-aware public-testnet faucet (0.125 TAZ; 24 h per address AND
+// per IP; POST /api/claim -> 202 queued -> poll GET /api/claim/:id). The old
+// jinolabs PoW faucet died at NU7 activation (2026-10-04) — see core.ts.
+interface FaucetStatus {
+  ready: boolean;
+  walletSynced: boolean;
+  payout: string;
+  addressCooldownSeconds: number;
+  chainHeight: number;
 }
 
-interface FaucetClaimResponse {
-  ok: boolean;
-  error?: string;
+interface FaucetClaim {
+  id: string;
+  status: 'queued' | 'sent' | 'failed' | string;
+  amount?: string;
   txid?: string;
+  error?: string;
+  message?: string;
+  retryAfterSeconds?: number;
 }
 
-const hexHasLeadingZeroBits = (hex: string, bits: number): boolean => {
-  let zeroBits = 0;
-  for (let i = 0; i < hex.length; i += 1) {
-    const nibble = parseInt(hex[i]!, 16);
-    if (nibble !== 0) return zeroBits >= bits;
-    zeroBits += 4;
-    if (zeroBits >= bits) return true;
-  }
-  return true;
-};
-
-// sha256(`${seed}:${nonce}`) needs >= difficulty leading zero bits (their pow-worker).
-export const solvePow = async (challenge: PowChallenge, deadlineMs: number): Promise<string> => {
-  const enc = new TextEncoder();
-  const prefix = `${challenge.seed}:`;
-  for (let n = 0; n < 50_000_000; n += 1) {
-    if (n % 8192 === 0 && Date.now() > deadlineMs) throw new Error('PoW deadline exceeded');
-    const digest = await crypto.subtle.digest('SHA-256', enc.encode(prefix + n));
-    const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
-    if (hexHasLeadingZeroBits(hex, challenge.difficulty)) return String(n);
-  }
-  throw new Error('PoW search exhausted');
-};
-
-// The faucet sits behind the dev/preview proxy and serves testnet only; there
-// is no mainnet faucet. Never hardcode a network the run isn't on: the claim
-// carries RUN_NETWORK, and a mainnet run refuses honestly instead of burning
-// PoW on a drip that can never land in this wallet.
+// Testnet only: there is no mainnet faucet. A mainnet run refuses honestly
+// instead of pretending a drip could land.
 export const step_faucetT = async (ctx: Ctx): Promise<void> => {
   try {
     if (RUN_NETWORK !== 'testnet') {
       throw new Error(`faucet serves testnet only; run network=${RUN_NETWORK} (no mainnet faucet exists)`);
     }
     if (ctx.transparentA === null) throw new Error('run S1c first (need transparent address)');
-    const challenge = (await (await fetch('/faucet-api/api/pow/challenge')).json()) as PowChallenge;
-    if (!challenge.ok) throw new Error('challenge refused');
-    const started = Date.now();
-    const nonce = await solvePow(challenge, started + 120_000);
-    note(ctx, `PoW solved in ${((Date.now() - started) / 1000).toFixed(1)}s (difficulty ${challenge.difficulty})`);
-    const claim = (await (
-      await fetch('/faucet-api/api/faucet', {
+    const status = (await (await fetch(`${FAUCET_API}/status`)).json()) as FaucetStatus;
+    if (!status.ready || !status.walletSynced) throw new Error(`faucet not ready (ready=${status.ready} walletSynced=${status.walletSynced})`);
+    note(ctx, `faucet at height ${status.chainHeight}, payout ${status.payout} TAZ`);
+    let claim = (await (
+      await fetch(`${FAUCET_API}/claim`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          address: ctx.transparentA,
-          network: RUN_NETWORK,
-          pow: { seed: challenge.seed, difficulty: challenge.difficulty, exp: challenge.exp, sig: challenge.sig, nonce },
-        }),
+        body: JSON.stringify({ address: ctx.transparentA }),
       })
-    ).json()) as FaucetClaimResponse;
-    if (!claim.ok) throw new Error(`claim refused: ${claim.error ?? 'unknown'}`);
+    ).json()) as FaucetClaim;
+    if (claim.error) throw new Error(`claim refused: ${claim.message ?? claim.error}`);
+    // Poll until the faucet reports broadcast ("sent"); confirmation waiting is
+    // P1's job (skipIfUnfunded gates on SDK-visible confirmed balance anyway).
+    for (let i = 0; i < 20 && claim.status === 'queued'; i += 1) {
+      await delay(5_000);
+      claim = (await (await fetch(`${FAUCET_API}/claim/${claim.id}`)).json()) as FaucetClaim;
+    }
+    if (claim.status === 'failed') throw new Error(`claim failed: ${claim.error ?? 'unknown'}`);
+    if (claim.status !== 'sent') throw new Error(`claim still ${claim.status} after 100 s`);
     record(ctx, 'FAUCET-t', true, `drip txid=${claim.txid ?? 'n/a'} to transparent receiver; wait for confirmation before P1`);
   } catch (e) {
     record(ctx, 'FAUCET-t', false, JSON.stringify(errorShape(e)));
@@ -258,11 +242,14 @@ export const closeB = async (ctx: Ctx): Promise<void> => {
 // funded legs (shieldable t balance) cannot run at all. A pool error from an
 // unfunded account ("UNSUPPORTED_POOL") is NOT evidence about the policy axis
 // under test — record an honest skip (ok:false, never a PASS) instead.
+// Same bar as the P2/P3 inline gates and frozenPolicy.shieldingThreshold:
+// below it, propose({kind:'shield'}) throws NOTHING_TO_SHIELD, and that error
+// is about the threshold, not the policy axis.
 const skipIfUnfunded = async (ctx: Ctx, step: StepName, detail: string): Promise<boolean> => {
   const balance = await clientA(ctx).getBalance({ accountId: requireAccountA(ctx) });
   const spendable = balance.amounts?.transparent.regular.spendable ?? 0n;
-  if (spendable > 0n) return false;
-  record(ctx, step, false, `SKIPPED: account unfunded (${balanceView(balance)}); ${detail}`);
+  if (spendable > SHIELDING_THRESHOLD) return false;
+  record(ctx, step, false, `SKIPPED: t-spendable <= shielding threshold (${balanceView(balance)}); ${detail}`);
   return true;
 };
 
@@ -293,7 +280,7 @@ export const stepP2_shieldAllowOwned = async (ctx: Ctx): Promise<void> => {
     await client.operations.abandon({ operationId: shieldProposal.operationId });
     const balance = await client.getBalance({ accountId });
     const spendable = balance.amounts?.transparent.regular.spendable ?? 0n;
-    if (spendable <= 10_000n) {
+    if (spendable <= SHIELDING_THRESHOLD) {
       // A skipped experiment NEVER reports PASS: without confirmed t funds the
       // allow-owned spend path went unexercised. ok:false keeps it visible.
       record(ctx, 'P2-shield-allow-owned', false, `${detail}SKIPPED t-spend leg (no confirmed t funds: ${balanceView(balance)}); fund via faucet + sync, then re-run`);
@@ -317,8 +304,8 @@ export const stepP3_directTransparentSend = async (ctx: Ctx): Promise<void> => {
     const balance = await client.getBalance({ accountId });
     const spendable = balance.amounts?.transparent.regular.spendable ?? 0n;
     // Unfunded is no evidence about the policy axis: honest skip, like P1/P2/P4.
-    if (spendable <= 10_000n) {
-      record(ctx, 'P3-direct-transparent-send', false, `SKIPPED: account unfunded (${balanceView(balance)}); t-send proposal needs >10_000 confirmed t; fund via faucet (testnet) + sync, then re-run`);
+    if (spendable <= SHIELDING_THRESHOLD) {
+      record(ctx, 'P3-direct-transparent-send', false, `SKIPPED: account unfunded (${balanceView(balance)}); t-send proposal needs > ${SHIELDING_THRESHOLD} confirmed t; fund via faucet (testnet) + sync, then re-run`);
       return;
     }
     const proposal = await client.propose({ accountId, to: ctx.transparentA!, amount: spendable - 5_000n });
@@ -463,14 +450,28 @@ export const stepS4b_resumeMined = async (ctx: Ctx): Promise<void> => {
     if (ctx.openedA === null || ctx.lastOperationId === null) throw new Error('need S4 first (operation id)');
     const client = clientA(ctx);
     const before = await client.operations.get({ operationId: ctx.lastOperationId });
+    const hadUnknown = before?.steps.flatMap((s) => s.attempts).some((a) => a.outcome === 'unknown') ?? false;
     const page = await client.operations.list();
     const pending = await client.operations.resume({ operationId: ctx.lastOperationId });
-    const state = await pending.snapshot();
+    // AC2: resume() reconciles the UNKNOWN attempt by txid/observation.
+    // wait() resolves only once every step has checked inclusion; a timeout
+    // retains the latest state, which we then read explicitly.
+    let confirmation: PaymentConfirmation | null = null;
+    try {
+      confirmation = await pending.wait({ timeoutMs: 300_000 });
+    } catch {
+      confirmation = null;
+    }
+    const state = confirmation?.snapshot ?? (await pending.snapshot());
+    const steps = state.steps.flatMap((s) => s.attempts.map((a) => a.outcome)).join(',');
+    const mined =
+      state.steps.some((s) => s.observation?.state === 'mined' && s.inclusion !== null) ||
+      (confirmation !== null && state.phase === 'complete');
     record(
       ctx,
       'S4b-resume-mined',
-      before?.steps.flatMap((s) => s.attempts).some((a) => a.outcome === 'unknown') ?? false,
-      `resume() over ${page.items.length} ops -> phase=${state.phase} attempts=[${state.steps.flatMap((s) => s.attempts.map((a) => a.outcome)).join(',')}] exactBytesRetained=${state.steps[0]?.exactBytesSha256 !== undefined}`,
+      hadUnknown && mined,
+      `resume() over ${page.items.length} ops -> phase=${state.phase} mined=${mined} hadUnknownBefore=${hadUnknown} attempts=[${steps}] exactBytesRetained=${state.steps[0]?.exactBytesSha256 !== undefined}`,
     );
   } catch (e) {
     record(ctx, 'S4b-resume-mined', false, JSON.stringify(errorShape(e)));
@@ -617,8 +618,8 @@ export const stepS5b_resumeMidSync = async (ctx: Ctx): Promise<void> => {
     record(
       ctx,
       'S5b-midsync-resume',
-      cPresent && recSane && resumed && balance === armed.balance,
-      `reload mid-scan: C-present=${cPresent} maxScanned armed=${armed.maxScannedHeight} after-kill=${progress} fullyScanned=${status.scan.fullyScannedHeight} (birthday ${armed.firstScanHeight}) resumed=${resumed} balance ${armed.balance} -> ${balance ?? '-'} recovery=${JSON.stringify(rec)}`,
+      cPresent && recSane && resumed && balance !== null,
+      `reload mid-scan: C-present=${cPresent} maxScanned armed=${armed.maxScannedHeight} after-kill=${progress} fullyScanned=${status.scan.fullyScannedHeight} (birthday ${armed.firstScanHeight}) resumed=${resumed} balance armed=${armed.balance} now=${balance ?? '-'} (equality NOT asserted: background sync may commit an inbound block across the kill) recovery=${JSON.stringify(rec)}`,
     );
   } catch (e) {
     record(ctx, 'S5b-midsync-resume', false, JSON.stringify(errorShape(e)));

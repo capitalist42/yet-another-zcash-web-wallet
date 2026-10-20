@@ -34,7 +34,7 @@ interface StepDef {
 const HANG_ENDPOINT = 'http://127.0.0.1:8081';
 const STEPS: StepDef[] = [
   { name: 'S1a-create-A', label: 'S1a open A(disallow)+create', run: (c) => step1a_createA(c, 'disallow') },
-  { name: 'S1b-current-null', label: 'S1b current() null on fresh', run: step1b_currentNull },
+  { name: 'S1b-current-probe', label: 'S1b current() probe (fresh)', run: step1b_currentNull },
   { name: 'S1c-next-mints', label: 'S1c next() mints + t-address', run: step1c_nextMints },
   { name: 'S1d-sync-tip', label: 'S1d sync to tip', run: step1d_syncTip },
   { name: 'FAUCET-t', label: 'Faucet drip -> transparent', run: step_faucetT },

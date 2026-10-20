@@ -19,18 +19,24 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 const ENDPOINT = process.env.YAW_ENDPOINT ?? 'https://zcash-mainnet.chainsafe.dev';
 const PROXY_NETWORK = process.env.YAW_NETWORK === 'testnet' ? 'testnet' : 'mainnet';
 const HANG_PATH = decodeURIComponent(new URL('drill/HANG', import.meta.url).pathname);
-const COOP_COEP = {
-  // Qualification parity with production hosting: enables crossOriginIsolated
-  // (threaded engine path) while keeping same-origin resources working.
-  'Cross-Origin-Opener-Policy': 'same-origin',
-  'Cross-Origin-Embedder-Policy': 'credentialless',
-};
+// Spike-only deviation from plan §1 ("no COOP/COEP"): the drill host sends
+// isolation headers so `crossOriginIsolated === true` and the engine's
+// threaded (SharedArrayBuffer) path is what gets qualified. Product config
+// stays COOP/COEP-free (plan §1 / Verification #8); YAW_ISOLATE=0 drops the
+// headers to re-qualify the single-threaded path against `vite preview`.
+const ISOLATE = process.env.YAW_ISOLATE !== '0';
+const COOP_COEP: Record<string, string> = ISOLATE
+  ? {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'credentialless',
+    }
+  : {};
 const FAUCET_PROXY = {
   // Spike-only: the faucet API answers without CORS headers.
   '/faucet-api': {
-    target: 'https://zcashfaucet.jinolabs.xyz',
+    target: 'https://faucet.testnet.valargroup.dev',
     changeOrigin: true,
-    rewrite: (path: string) => path.replace(/^\/faucet-api/, ''),
+    rewrite: (path: string) => path.replace(/^\/faucet-api/, '/api'),
   },
 };
 

@@ -7,15 +7,41 @@
 // the wallet through S5 to prove reload survival. S5b arms a mid-scan snapshot,
 // kills the tab RAW mid-flight (button, no closeAll), then resumes after load.
 import { chromium } from 'playwright-core';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 
-const CHROME = `${homedir()}/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome`;
+// Chrome binary: YAW_CHROME wins; otherwise newest chromium-* under the
+// Playwright cache (revision follows the installed playwright-core, so a
+// version bump must not break the drill).
+const CHROME =
+  process.env.YAW_CHROME ??
+  (() => {
+    const cache = `${homedir()}/.cache/ms-playwright`;
+    const revs = existsSync(cache)
+      ? readdirSync(cache)
+          .filter((d) => /^chromium-\d+$/.test(d))
+          .sort((a, b) => Number(b.split('-')[1]) - Number(a.split('-')[1]))
+      : [];
+    for (const rev of revs) {
+      for (const p of [`${cache}/${rev}/chrome-linux64/chrome`, `${cache}/${rev}/chrome-linux/chrome`]) {
+        if (existsSync(p)) return p;
+      }
+    }
+    return undefined;
+  })();
+if (CHROME === undefined) {
+  console.error(`No chromium under ${homedir()}/.cache/ms-playwright — run: npx playwright-core install chromium (or set YAW_CHROME=/path/to/chrome)`);
+  process.exit(1);
+}
+
 const APP = process.env.YAW_APP ?? 'http://127.0.0.1:4173/';
+// Extra query for the app page, e.g. YAW_APP_QUERY=network=testnet&endpoint=…
+// (the run target otherwise defaults to mainnet).
+const APP_QUERY = process.env.YAW_APP_QUERY ?? '';
 // Button substrings (unique) per step.
 const LABELS = {
   'S1a-create-A': 'S1a open A',
-  'S1b-current-null': 'S1b current()',
+  'S1b-current-probe': 'S1b current()',
   'S1c-next-mints': 'S1c next()',
   'S1d-sync-tip': 'S1d sync',
   'FAUCET-t': 'Faucet drip',
@@ -48,7 +74,7 @@ page.on('console', (m) => {
 });
 page.on('pageerror', (e) => console.log('[pageerror]', String(e).slice(0, 300)));
 
-await page.goto(APP, { waitUntil: 'networkidle' });
+await page.goto(APP_QUERY ? `${APP}?${APP_QUERY}` : APP, { waitUntil: 'networkidle' });
 
 const button = (label) => page.locator('button', { hasText: label }).first();
 
