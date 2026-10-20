@@ -1,9 +1,11 @@
 // Ticket #2 kill-drill runner: drives the spike UI in real Chromium (OPFS worker,
-// WASM engine, real testnet). Throwaway; run with the vite dev server up:
+// WASM engine, real chain — mainnet by default; testnet via ?network=testnet).
+// Throwaway; run with the vite dev/preview server up:
 //   node scripts/drill.mjs [stepName ...]
 // No args => run every step in order. S4 toggles the dev-server hang proxy around
 // the submit; S5 closes the tab (via the UI close+reload button), then reopens
-// the wallet through S5 to prove reload survival.
+// the wallet through S5 to prove reload survival. S5b arms a mid-scan snapshot,
+// kills the tab RAW mid-flight (button, no closeAll), then resumes after load.
 import { chromium } from 'playwright-core';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -20,13 +22,15 @@ const LABELS = {
   'P1-shield-disallow': 'P1 shield()',
   'P2-shield-allow-owned': 'P2 reopen',
   'P3-direct-transparent-send': 'P3 t-spend',
-  'P4-shield-execute': 'P4 shield()',
+  'P4-shield-execute': 'P4 reviewed',
   'S3-shield-send': 'S3 open B',
   'S3b-memo-send': 'S3b memo',
   'S3c-history-both': 'S3c history',
   'S4-submit-unknown': 'S4 send via hang',
   'S4b-resume-mined': 'S4b reopen',
   'S5-reload-sane': 'S5 reopen',
+  'S5b-midsync-arm': 'S5b arm mid-scan',
+  'S5b-midsync-resume': 'S5b resume after',
 };
 const ORDER = Object.keys(LABELS);
 
@@ -83,6 +87,19 @@ for (const step of steps) {
     // Tab death: UI button closes clients (releases OPFS) then reloads the page.
     await page.locator('button', { hasText: 'close + reload' }).click();
     await page.waitForLoadState('networkidle');
+    await clickAndWait(label, 180_000);
+    continue;
+  }
+  if (step === 'S5b-midsync-arm') {
+    // Arm records the mid-scan snapshot, then THIS kills the tab mid-flight:
+    // raw reload button (no closeAll), so the scan worker dies uncleanly.
+    await clickAndWait(label, 360_000);
+    await page.locator('button', { hasText: 'reload mid-scan (kill)' }).click();
+    await page.waitForLoadState('networkidle');
+    continue;
+  }
+  if (step === 'S5b-midsync-resume') {
+    // Fresh page after the mid-sync kill: reopen C from durable DB.
     await clickAndWait(label, 180_000);
     continue;
   }

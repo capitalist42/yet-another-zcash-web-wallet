@@ -46,7 +46,9 @@ export type StepName =
   | 'S3c-history-both'
   | 'S4-submit-unknown'
   | 'S4b-resume-mined'
-  | 'S5-reload-sane';
+  | 'S5-reload-sane'
+  | 'S5b-midsync-arm'
+  | 'S5b-midsync-resume';
 
 export interface StepResult {
   ok: boolean;
@@ -150,8 +152,10 @@ export const syncTolerant = async (client: WalletClient, attempts = 8): Promise<
 export interface Ctx {
   storageA: string;
   storageB: string;
+  storageC: string;
   mnemonicA: string;
   mnemonicB: string;
+  mnemonicC: string;
   accountA: AccountId | null;
   accountB: AccountId | null;
   unifiedA: string | null;
@@ -160,8 +164,24 @@ export interface Ctx {
   lastOperationId: string | null;
   openedA: OpenedWallet | null;
   openedB: OpenedWallet | null;
+  openedC: OpenedWallet | null;
   signerA: MemorySigner | null;
   sync: SyncStatus | null;
+  // Persisted snapshot taken just before killing a tab mid-scan (plan §0.4:
+  // reload mid-watchSync => sane recovery report + committed scan progress
+  // resumes from the DB, no rescan from zero). In-flight progress is NOT
+  // observable (watchSync only publishes on state transitions; scan-state
+  // reads serialize behind the busy worker), so the snapshot records the
+  // import birthday and tip only; the durable proof is read after the kill.
+  midSync: null | {
+    at: string;
+    accountC: AccountId;
+    firstScanHeight: number;
+    maxScannedHeight: number;
+    fullyScannedHeight: number | null;
+    tipHeight: number;
+    balance: string;
+  };
   steps: Partial<Record<StepName, StepResult>>;
   log: string[];
 }
@@ -177,8 +197,10 @@ export const loadCtx = (): Ctx => {
   return {
     storageA: `yaw-spike-A-${RUN_NETWORK}`,
     storageB: `yaw-spike-B-${RUN_NETWORK}`,
+    storageC: `yaw-spike-C-${RUN_NETWORK}`,
     mnemonicA: phrase(),
     mnemonicB: phrase(),
+    mnemonicC: phrase(),
     accountA: null,
     accountB: null,
     unifiedA: null,
@@ -187,15 +209,38 @@ export const loadCtx = (): Ctx => {
     lastOperationId: null,
     openedA: null,
     openedB: null,
+    openedC: null,
     signerA: null,
     sync: null,
+    midSync: null,
     steps: {},
     log: [],
   };
 };
 
+// The SDK has no deleteDatabase hook (plan §1 storage): delete = close all
+// owners, then recursive OPFS dir removal. Dev-only escape hatch for stale
+// spike DBs (duplicate accounts, wrong-network storage names); fails loudly
+// while any client still holds the exclusive lease.
+export async function purgeSpikeDatabases(): Promise<string[]> {
+  const root = await navigator.storage.getDirectory();
+  const purged: string[] = [];
+  // lib.dom's FileSystemDirectoryHandle omits the async-iterator members
+  // (keys/values/entries) even though Chromium implements them.
+  for await (const [name] of root as unknown as AsyncIterable<[string, unknown]>) {
+    if (!name.startsWith('yaw-spike-')) continue;
+    await root.removeEntry(name, { recursive: true });
+    purged.push(name);
+  }
+  return purged;
+}
+
+export const resetSession = (): void => {
+  sessionStorage.removeItem(CTX_KEY);
+};
+
 export const persistCtx = (ctx: Ctx): void => {
-  const clone: Ctx = { ...ctx, openedA: null, openedB: null, signerA: null, sync: null };
+  const clone: Ctx = { ...ctx, openedA: null, openedB: null, openedC: null, signerA: null, sync: null };
   sessionStorage.setItem(CTX_KEY, JSON.stringify(clone, bigintReplacer));
 };
 

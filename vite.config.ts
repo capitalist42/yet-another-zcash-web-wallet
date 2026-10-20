@@ -1,14 +1,23 @@
-import { defineConfig, type Connect } from 'vite';
+import { defineConfig, type Connect, type ViteDevServer, type PreviewServer } from 'vite';
 import react from '@vitejs/plugin-react';
 import { createServer } from 'node:http';
-import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 // Ticket #2 spike config. Plan §1: no inlined assets (engine ships WASM, workers,
 // proving params as real files). The S4 drill proxy and COOP/COEP headers exist
 // only to qualify SUBMISSION_UNKNOWN and the threaded runtime; product config
 // will not inherit them.
 
-const ENDPOINT = 'https://zcash-testnet.chainsafe.dev';
+// S4's hang-proxy upstream. Configured NODE-side (the page cannot see the
+// proxy's network), so it MUST be paired with the browser run target:
+//   mainnet drill (default):  npm run dev / preview  (page default network=mainnet)
+//   testnet drill:            YAW_ENDPOINT=https://zcash-testnet.chainsafe.dev YAW_NETWORK=testnet npm run dev
+//                             and open the app with ?network=testnet — the page
+//                             asks the proxy (GET /drill/config) and S4 refuses
+//                             to broadcast if the two networks disagree.
+const ENDPOINT = process.env.YAW_ENDPOINT ?? 'https://zcash-mainnet.chainsafe.dev';
+const PROXY_NETWORK = process.env.YAW_NETWORK === 'testnet' ? 'testnet' : 'mainnet';
 const HANG_PATH = decodeURIComponent(new URL('drill/HANG', import.meta.url).pathname);
 const COOP_COEP = {
   // Qualification parity with production hosting: enables crossOriginIsolated
@@ -31,7 +40,10 @@ function toggleMiddleware(): Middleware {
   return (req, res, next) => {
     const toggle = /^\/drill\/(on|off|status)$/.exec(req.url ?? '');
     if (toggle === null) return next();
-    if (toggle[1] === 'on') writeFileSync(HANG_PATH, '1');
+    if (toggle[1] === 'on') {
+      mkdirSync(dirname(HANG_PATH), { recursive: true });
+      writeFileSync(HANG_PATH, '1');
+    }
     if (toggle[1] === 'off' && existsSync(HANG_PATH)) unlinkSync(HANG_PATH);
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ hang: existsSync(HANG_PATH) }));
@@ -44,6 +56,15 @@ function toggleMiddleware(): Middleware {
 // SUBMISSION_UNKNOWN in the engine journal.
 function createProxyServer() {
   return createServer((req, res) => {
+    // Self-description for the page-side network guard (steps.ts
+    // ensureProxyNetwork): the browser cannot know which network this node
+    // process fronts; S4 refuses to broadcast on mismatch.
+    if ((req.url ?? '').startsWith('/drill/config')) {
+      res.setHeader('content-type', 'application/json');
+      res.setHeader('access-control-allow-origin', req.headers.origin ?? '*');
+      res.end(JSON.stringify({ network: PROXY_NETWORK, endpoint: ENDPOINT }));
+      return;
+    }
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'access-control-allow-origin': req.headers.origin ?? '*',
@@ -99,10 +120,10 @@ function hangProxy() {
   };
   return {
     name: 'yaw-s4-hang-proxy',
-    configureServer(server: import('vite').ViteDevServer) {
+    configureServer(server: ViteDevServer) {
       attach(server.middlewares, server.httpServer);
     },
-    configurePreviewServer(server: import('vite').PreviewServer) {
+    configurePreviewServer(server: PreviewServer) {
       attach(server.middlewares, server.httpServer);
     },
   };

@@ -1,6 +1,6 @@
 // Ticket #2 spike UI: step buttons + state panel + log. Throwaway; no product UI.
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { dump, loadCtx, persistCtx } from './core';
+import { dump, loadCtx, persistCtx, purgeSpikeDatabases, resetSession } from './core';
 import type { Ctx, StepName, StepResult } from './core';
 import {
   closeAll,
@@ -20,6 +20,8 @@ import {
   stepS4_submitUnknown,
   stepS4b_resumeMined,
   stepS5_reloadSane,
+  stepS5b_armMidSync,
+  stepS5b_resumeMidSync,
   step_faucetT,
 } from './steps';
 
@@ -39,7 +41,7 @@ const STEPS: StepDef[] = [
   { name: 'P1-shield-disallow', label: 'P1 shield() under disallow', run: async (c) => { await openA(c, 'disallow'); await stepP1_shieldDisallow(c); } },
   { name: 'P2-shield-allow-owned', label: 'P2 reopen allow-owned: proposals', run: stepP2_shieldAllowOwned },
   { name: 'P3-direct-transparent-send', label: 'P3 t-spend under disallow => reject', run: async (c) => { await openA(c, 'disallow'); await stepP3_directTransparentSend(c); } },
-  { name: 'P4-shield-execute', label: 'P4 shield() execute (mine)', run: async (c) => { await openA(c, 'disallow'); await stepP4_shieldExecute(c); } },
+  { name: 'P4-shield-execute', label: 'P4 reviewed shield propose->send (mine)', run: async (c) => { await openA(c, 'allow-owned'); await stepP4_shieldExecute(c); } },
   {
     name: 'S3-shield-send',
     label: 'S3 open B + A->B shielded send',
@@ -63,6 +65,11 @@ const STEPS: StepDef[] = [
       await stepS4b_resumeMined(c);
     } },
   { name: 'S5-reload-sane', label: 'S5 reopen after reload', run: stepS5_reloadSane },
+  // AC3 pair: arm opens C + fullScan import and starts the scan; then the
+  // RAW RELOAD button (below) kills the tab mid-flight — NO closeAll, that
+  // would be a clean shutdown and hide exactly what AC3 tests.
+  { name: 'S5b-midsync-arm', label: 'S5b arm mid-scan (C fullScan)', run: stepS5b_armMidSync },
+  { name: 'S5b-midsync-resume', label: 'S5b resume after mid-sync reload', run: stepS5b_resumeMidSync },
 ];
 
 const badge = (r: StepResult | undefined): string => (r === undefined ? '·' : r.ok ? 'PASS' : 'FAIL');
@@ -127,7 +134,16 @@ export default function SpikeApp() {
           ))}
           <div style={{ marginTop: 8 }}>
             <button onClick={download}>dump JSON</button>{' '}
-            <button onClick={() => void closeAll(ctx).then(() => window.location.reload())}>close + reload</button>
+            <button onClick={() => void closeAll(ctx).then(() => window.location.reload())}>close + reload</button>{' '}
+            <button onClick={() => window.location.reload()} title="raw reload: kills the scan worker mid-flight (AC3 mid-sync reload); no clean close">
+              reload mid-scan (kill)
+            </button>{' '}
+            <button
+              onClick={() => void purgeSpikeDatabases().then(() => resetSession()).then(() => window.location.reload())}
+              title="delete all yaw-spike-* OPFS dirs (fails loudly while a client holds the lease), clear session ctx, reload"
+            >
+              purge spike DBs
+            </button>
           </div>
         </div>
         <div>
