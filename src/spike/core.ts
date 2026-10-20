@@ -166,7 +166,7 @@ export interface Ctx {
   log: string[];
 }
 
-const CTX_KEY = '***';
+const CTX_KEY = 'yaw-spike-ctx';
 
 const bigintReplacer = (_key: string, value: unknown): unknown =>
   typeof value === 'bigint' ? value.toString() : value;

@@ -13,7 +13,7 @@ import {
   syncTolerant,
 } from './core';
 import type { Ctx, TransparentMode } from './core';
-import type { AddressRecord } from '@zcashlabs/zcash.js';
+import type { AccountRecord, AddressRecord, MemorySigner, WalletClient } from '@zcashlabs/zcash.js';
 import { isZcashError } from '@zcashlabs/zcash.js';
 
 const delay = (ms: number): Promise<void> => {
@@ -26,16 +26,22 @@ const delay = (ms: number): Promise<void> => {
 
 export const step1a_createA = async (ctx: Ctx, transparent: TransparentMode = 'disallow'): Promise<void> => {
   try {
+    if (ctx.openedA !== null) {
+      await ctx.openedA.client.close();
+      ctx.openedA = null;
+    }
     const opened = await openWallet(ctx.storageA, transparent);
     ctx.openedA = opened;
     note(ctx, `client open; recovery=${JSON.stringify(opened.recovery)}`);
     // accounts.create requires coherent chain state (doc: stale => SYNC_REQUIRED).
     await syncTolerant(opened.client);
-    const created = await opened.client.accounts.create({ mnemonic: seedBytes(ctx.mnemonicA), name: 'spike-A' });
-    ctx.accountA = created.account.id;
-    ctx.signerA = created.signer;
-    const binding = await opened.client.accounts.attachSigner({ accountId: created.account.id, signer: created.signer });
-    record(ctx, 'S1a-create-A', binding.state === 'ready', `account=${created.account.id} birthday=${created.account.birthdayHeight} binding=${binding.state}`);
+    // Re-run must not collide (ACCOUNT_COLLISION on same mnemonic) nor double-open the
+    // OPFS lease the previous client still holds.
+    const { account, signer, adopted } = await ensureAccountA(opened.client, ctx);
+    ctx.accountA = account.id;
+    ctx.signerA = signer;
+    const binding = await opened.client.accounts.attachSigner({ accountId: account.id, signer });
+    record(ctx, 'S1a-create-A', binding.state === 'ready', `account=${account.id} birthday=${account.birthdayHeight} binding=${binding.state}${adopted ? ' adopted=existing' : ''}`);
   } catch (e) {
     record(ctx, 'S1a-create-A', false, JSON.stringify(errorShape(e)));
   }
@@ -161,13 +167,38 @@ export const openA = async (ctx: Ctx, transparent: TransparentMode, broadcasterE
     await ctx.openedA.client.close();
     ctx.openedA = null;
   }
-  ctx.openedA = await openWallet(ctx.storageA, transparent, broadcasterEndpoint);
-  await syncTolerant(ctx.openedA.client);
-  if (ctx.accountA !== null) {
-    const restored = await ctx.openedA.client.accounts.restoreSigner({ accountId: ctx.accountA, mnemonic: seedBytes(ctx.mnemonicA) });
-    ctx.signerA = restored;
-    await ctx.openedA.client.accounts.attachSigner({ accountId: ctx.accountA, signer: restored });
+  const opened = await openWallet(ctx.storageA, transparent, broadcasterEndpoint);
+  ctx.openedA = opened;
+  await syncTolerant(opened.client);
+  // Adopt-first: the DB already has spike-A on re-run/reopen/reload.
+  const { account, signer } = await ensureAccountA(opened.client, ctx);
+  ctx.accountA = account.id;
+  ctx.signerA = signer;
+  await opened.client.accounts.attachSigner({ accountId: account.id, signer });
+};
+
+// Open account A in the given client: adopt an existing spike-A account when the
+// DB already has one (re-run / reopen / reload), create fresh otherwise.
+// Finding (live mainnet 2026-10-20): create() does NOT enforce ACCOUNT_COLLISION for
+// the same mnemonic in the same DB — a second create silently adds a duplicate
+// account with a fresh birthday. Hence adopt-first, not create-then-adopt.
+// Returns the mnemonic-derived signer; caller attaches it.
+const ensureAccountA = async (
+  client: WalletClient,
+  ctx: Ctx,
+): Promise<{ account: AccountRecord; signer: MemorySigner; adopted: boolean }> => {
+  const accounts = await client.accounts.list();
+  const existing =
+    accounts.find((a) => a.id === ctx.accountA) ?? accounts.find((a) => a.name === 'spike-A');
+  if (existing !== undefined) {
+    const signer = await client.accounts.restoreSigner({
+      accountId: existing.id,
+      mnemonic: seedBytes(ctx.mnemonicA),
+    });
+    return { account: existing, signer, adopted: true };
   }
+  const created = await client.accounts.create({ mnemonic: seedBytes(ctx.mnemonicA), name: 'spike-A' });
+  return { account: created.account, signer: created.signer, adopted: false };
 };
 
 export const openB = async (ctx: Ctx): Promise<void> => {
