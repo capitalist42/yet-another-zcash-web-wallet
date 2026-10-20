@@ -12,11 +12,22 @@ import type {
   WalletBalance,
   WalletClient,
 } from '@zcashlabs/zcash.js';
-import { generateMnemonic, mnemonicToSeed, validateMnemonic } from '@scure/bip39';
+import { generateMnemonic, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
 
 export const TESTNET_ENDPOINT = 'https://zcash-testnet.chainsafe.dev';
+export const MAINNET_ENDPOINT = 'https://zcash-mainnet.chainsafe.dev';
 export const FAUCET_ORIGIN = 'https://zcashfaucet.jinolabs.xyz';
+
+// Live-qualification run target. Testnet is NU7 since 2026-10-04 (height
+// 4,465,026; branch 77190ad9) and rc.5's codec stops at Nu6_3 (37a5165b), so
+// the only public chain rc.5 can currently open is mainnet. ?endpoint=…&network=…
+// selects the run target without rebuilding the bundle.
+const runParams = new URLSearchParams(window.location.search);
+export const RUN_NETWORK: 'mainnet' | 'testnet' =
+  runParams.get('network') === 'testnet' ? 'testnet' : 'mainnet';
+export const RUN_ENDPOINT =
+  runParams.get('endpoint') ?? (RUN_NETWORK === 'mainnet' ? MAINNET_ENDPOINT : TESTNET_ENDPOINT);
 
 export type TransparentMode = 'disallow' | 'allow-owned';
 
@@ -45,9 +56,10 @@ export interface StepResult {
 
 export const phrase = (): string => generateMnemonic(wordlist, 256);
 
-export const seedBytes = async (mnemonic: string): Promise<Uint8Array> => {
+// SDK contract (docs/api/accounts-signers.md): UTF-8 phrase bytes, NOT mnemonicToSeed output.
+export const seedBytes = (mnemonic: string): Uint8Array => {
   if (!validateMnemonic(mnemonic, wordlist)) throw new Error('invalid mnemonic');
-  return new Uint8Array(await mnemonicToSeed(mnemonic));
+  return new TextEncoder().encode(mnemonic);
 };
 
 export interface ErrorShape {
@@ -89,9 +101,9 @@ export async function openWallet(
   transparent: TransparentMode,
   broadcasterEndpoint: string | null = null,
 ): Promise<OpenedWallet> {
-  const light = await createLightClient(TESTNET_ENDPOINT, { network: 'testnet' });
+  const light = await createLightClient(RUN_ENDPOINT, { network: RUN_NETWORK });
   const broadcaster =
-    broadcasterEndpoint === null ? light : await createLightClient(broadcasterEndpoint, { network: 'testnet' });
+    broadcasterEndpoint === null ? light : await createLightClient(broadcasterEndpoint, { network: RUN_NETWORK });
   const client = await createWalletClient({
     network: light.network,
     light,
@@ -104,6 +116,36 @@ export async function openWallet(
   });
   return { client, light, recovery: client.recovery };
 }
+
+// Live mainnet produces blocks every ~75 s; enhancement's tip-vs-retained-point
+// read races them (enhancement.js unspent()). Both throw codes documented as
+// retry-via-sync (errors-lifecycle.md: CURSOR_STALE / RECOVERY_REQUIRED).
+const delay = (ms: number): Promise<void> => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+};
+
+export const isResyncGuided = (e: unknown): boolean =>
+  isZcashError(e) && e.recovery === 'sync' && (e.code === 'RECOVERY_REQUIRED' || e.code === 'CURSOR_STALE');
+
+// Observed live 2026-10-20: retries spaced across the ~75 s block cadence
+// sometimes recover (run 1), sometimes don't (run 2: 8 spaced fails, then a
+// fresh client reopen on the same OPFS DB synced clean). Reliable remedy is
+// reopen, not spacing; retries kept here for the cheap win anyway.
+export const syncTolerant = async (client: WalletClient, attempts = 8): Promise<SyncStatus> => {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await client.sync();
+    } catch (e) {
+      if (!isResyncGuided(e)) throw e;
+      lastError = e;
+      await delay(10_000);
+    }
+  }
+  throw lastError;
+};
 
 export interface Ctx {
   storageA: string;
@@ -133,8 +175,8 @@ export const loadCtx = (): Ctx => {
   const stored = sessionStorage.getItem(CTX_KEY);
   if (stored !== null) return JSON.parse(stored) as Ctx;
   return {
-    storageA: 'yaw-spike-A',
-    storageB: 'yaw-spike-B',
+    storageA: `yaw-spike-A-${RUN_NETWORK}`,
+    storageB: `yaw-spike-B-${RUN_NETWORK}`,
     mnemonicA: phrase(),
     mnemonicB: phrase(),
     accountA: null,
