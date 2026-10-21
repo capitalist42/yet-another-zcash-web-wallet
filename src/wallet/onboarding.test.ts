@@ -98,8 +98,32 @@ describe('create wallet', () => {
     expect(retry.ok).toBe(true);
     expect(app.screen.get()).toBe('wallet');
   });
-});
 
+  it('one SYNC_REQUIRED from create is absorbed by a freshness retry', async () => {
+    const created = await app.onCreate.generate();
+    engine.queueWallet({ createFailures: 1, accounts: [{ id: 'acct-1' }] });
+    const res = await app.onCreate.confirmBackup(created.phrase);
+    expect(res.ok).toBe(true);
+    const w = engine.lastWallet();
+    // freshness pass precedes the create; retry path: fail, re-sync, succeed
+    const first = w.calls.indexOf('syncFresh');
+    const second = w.calls.lastIndexOf('syncFresh');
+    expect(first).toBeGreaterThan(-1);
+    expect(second).toBeGreaterThan(first);
+    expect(w.calls.filter((c) => c === 'createSeed')).toHaveLength(2);
+    expect(w.calls.filter((c) => c === 'syncFresh')).toHaveLength(2);
+    expect(app.screen.get()).toBe('wallet');
+  });
+
+  it('persistent SYNC_REQUIRED surfaces after the single retry', async () => {
+    const created = await app.onCreate.generate();
+    engine.queueWallet({ createFailures: 2 });
+    const res = await app.onCreate.confirmBackup(created.phrase);
+    expect(res).toMatchObject({ ok: false, code: 'SYNC_REQUIRED' });
+    expect(await registry.list('testnet')).toHaveLength(0);
+  });
+
+});
 describe('restore', () => {
   it('restores with accountIndex 0 + explicit birthday, then goes live', async () => {
     const res = await app.onRestore.restore({

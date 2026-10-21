@@ -61,5 +61,9 @@ export const DEFAULT_ENDPOINTS: EndpointSettings = {
   testnet: 'https://zcash-testnet.chainsafe.dev',
 };
 
+/** Upper bound on endpoint latency for a pre-mutation freshness pass; NOT a
+ * scan budget (create's SYNC_REQUIRED retry is the correctness mechanism). */
+export const FRESHNESS_TIMEOUT_MS = 30_000;
+
 /** One OPFS database per Wallet, per network (ADR-0003). */
 export const storageName = (network: NetworkId, walletId: string): string => `yaw-${network}-${walletId}`;

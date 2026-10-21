@@ -23,6 +23,8 @@ export interface FakeAccountSpec {
   id: string;
   name?: string | null;
   viewOnly?: boolean;
+  /** Reload truth: a seed account reopens viewOnly:false, signerAttached:false. */
+  signerAttached?: boolean;
   birthdayHeight?: number;
   accountIndex?: number | null;
   addresses?: string[];
@@ -40,6 +42,9 @@ export interface FakeWalletSpec {
   openError?: EngineErrorCode;
   /** Sync statuses startSync() pushes onto watchSync streams. */
   syncSteps?: EngineSyncStatus[];
+  /** Throw SYNC_REQUIRED from the first N createSeed/importSeed calls
+   * (models the SDK's stale-chain-state precondition). */
+  createFailures?: number;
 }
 
 export interface FakeOpenRecord {
@@ -121,11 +126,13 @@ export class FakeWallet implements EngineWallet {
   private readonly specs = new Map<string, FakeAccountSpec>();
   private openGate: Deferred | null = null;
   private syncQueue: EngineSyncStatus[] = [];
+  private createFails: number;
 
   constructor(spec: FakeWalletSpec) {
     this.recovery = defaultRecovery(spec.recovery);
     this.operations = [...(spec.operations ?? [])];
     this.syncQueue = [...(spec.syncSteps ?? [])];
+    this.createFails = spec.createFailures ?? 0;
     if (spec.holdOpen === true) this.openGate = new Deferred();
     if (spec.openError !== undefined) {
       throw new EngineError(spec.openError, `open failed: ${spec.openError}`);
@@ -171,7 +178,9 @@ export class FakeWallet implements EngineWallet {
       birthdayHeight: a.birthdayHeight ?? 1,
       accountIndex: a.accountIndex ?? null,
       viewOnly: a.viewOnly ?? false,
-      signerAttached: !(a.viewOnly ?? false),
+      // SDK truth (both create and reload): returned signers are UNATTACHED;
+      // don't key locked UI on viewOnly (spike live finding). Specs opt in.
+      signerAttached: a.signerAttached ?? false,
     };
   }
 
@@ -187,6 +196,7 @@ export class FakeWallet implements EngineWallet {
 
   async createSeed(args: { mnemonic: Uint8Array; name?: string }): Promise<EngineSeedAccount> {
     this.check('createSeed');
+    this.freshnessGate();
     this.assertPhrase(args.mnemonic);
     return this.makeSeed(args.name ?? 'wallet', false, 0, 1);
   }
@@ -199,9 +209,19 @@ export class FakeWallet implements EngineWallet {
     name?: string;
   }): Promise<EngineSeedAccount> {
     this.check('importSeed');
+    this.freshnessGate();
     this.assertPhrase(args.mnemonic);
     const height = args.birthday === 'fullScan' ? 1 : args.birthday.firstScanHeight;
     return this.makeSeed(args.name ?? 'restored', false, args.accountIndex, height);
+  }
+
+  /** Models the SDK precondition: stale local chain state rejects account
+   * mutation with SYNC_REQUIRED until a freshness pass lands. */
+  private freshnessGate(): void {
+    if (this.createFails > 0) {
+      this.createFails -= 1;
+      throw new EngineError('SYNC_REQUIRED', 'sync the wallet before continuing', true);
+    }
   }
 
   private assertPhrase(mnemonic: Uint8Array): void {
@@ -285,6 +305,11 @@ export class FakeWallet implements EngineWallet {
   async startSync(): Promise<void> {
     this.check('startSync');
     for (const status of this.syncQueue) this.pushSync(status);
+  }
+
+  async syncFresh(_timeoutMs: number): Promise<void> {
+    this.check('syncFresh');
+    // the scripted freshnessGate() decides whether mutation still rejects
   }
 
   async listOperations(): Promise<readonly EngineOperation[]> {

@@ -25,5 +25,10 @@ let bootStarted = false;
 export const startApp = (): void => {
   if (bootStarted) return;
   bootStarted = true;
-  void getApp().boot();
+  const app = getApp();
+  // Live-qualification override: /?network=mainnet|testnet picks the boot
+  // Network before the registry is consulted (no wallet exists yet).
+  const forced = new URLSearchParams(location.search).get('network');
+  if (forced === 'mainnet' || forced === 'testnet') app.network.set(forced);
+  void app.boot();
 };

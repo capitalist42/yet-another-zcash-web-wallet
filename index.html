@@ -2,10 +2,16 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <title>Zcash Wallet</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- script-src needs blob: for the SDK's blob-URL wallet worker (live
+         finding: without it open() fails RUNTIME_UNAVAILABLE);
+         wasm-unsafe-eval for the codec; connect-src self+https: = endpoints
+         (ADR-0001). -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https:; worker-src 'self' blob:"
+      content="default-src 'self'; script-src 'self' blob: 'wasm-unsafe-eval'; connect-src 'self' https:; worker-src 'self' blob:"
     />
   </head>
   <body>

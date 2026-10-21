@@ -12,7 +12,7 @@ import type {
 } from './engine/port';
 import { EngineError, isNonTerminal } from './engine/port';
 import type { Registry, WalletKind, WalletRecord } from './registry';
-import { storageName, type EndpointSettings } from './policy';
+import { storageName, FRESHNESS_TIMEOUT_MS, type EndpointSettings } from './policy';
 import { fingerprintFromUfvk } from './fingerprint';
 import { generatePhrase, normalizePhrase, phraseBytes, zeroize } from './keys';
 
@@ -182,11 +182,16 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (account !== undefined) {
       balances.set(await w.getBalance(account.id));
       const current = await w.currentAddress(account.id);
-      address.set(current ?? (await w.mintAddress(account.id)));
+      // A view-only account cannot mint (the SDK has no spend key to derive
+      // the next shielded address from); the current one is the truth.
+      address.set(current ?? (account.viewOnly ? null : await w.mintAddress(account.id)));
       await refreshOperations();
     }
-    await w.startSync();
+    // Subscribe BEFORE triggering sync: the SDK stream only publishes on
+    // scan-revision changes, so ticks fired between start and subscribe
+    // would be lost (spike §Sync).
     void watchLoop(w);
+    await w.startSync();
     await deps.registry.touch(record.id);
     screen.set('wallet');
   };
@@ -256,7 +261,18 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         storageName: storageName(network.get(), id),
         allowTransparentSends: false,
       });
-      const fingerprintSource = await args.run(w);
+      // accounts.create requires coherent local chain state (SDK: stale =>
+      // SYNC_REQUIRED before mutation, "after explicit sync"). Bounded
+      // freshness pass first; one retry covers the live tip race (spike S1d).
+      await w.syncFresh(FRESHNESS_TIMEOUT_MS);
+      let fingerprintSource: string;
+      try {
+        fingerprintSource = await args.run(w);
+      } catch (e) {
+        if (!(e instanceof EngineError) || e.code !== 'SYNC_REQUIRED') throw e;
+        await w.syncFresh(FRESHNESS_TIMEOUT_MS);
+        fingerprintSource = await args.run(w);
+      }
       const fingerprint = await fingerprintFromUfvk(fingerprintSource);
       await deps.requestPersist();
       await closeWallet();

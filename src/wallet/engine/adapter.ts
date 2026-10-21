@@ -48,6 +48,7 @@ const mapError = (e: unknown): EngineError => {
     'NETWORK_MISMATCH',
     'TRANSPORT_ERROR',
     'SIGNER_REQUIRED',
+    'SYNC_REQUIRED',
     'TIMEOUT',
   ];
   // ACCOUNT_BUSY is the same lease collision the UI renders as storage-busy.
@@ -58,7 +59,10 @@ const mapError = (e: unknown): EngineError => {
       : e.recovery === 'correct-input'
         ? 'INVALID_ARGUMENT'
         : 'UNKNOWN';
-  return new EngineError(code, e.message, e.retryable);
+  // e.g. RUNTIME_UNAVAILABLE carries the codec/protocol diagnosis; never
+  // drop the SDK code on the floor when the port code collapses.
+  const message = code === 'UNKNOWN' ? `${e.code}: ${e.message}` : e.message;
+  return new EngineError(code, message, e.retryable);
 };
 
 const mapAccount = (a: AccountRecord): EngineAccount => ({
@@ -281,6 +285,18 @@ class AdapterWallet implements EngineWallet {
    * boot must not block on it. Failures surface via the sync stream/status. */
   async startSync(): Promise<void> {
     this.client.sync().catch(() => undefined);
+  }
+
+  /** Bounded freshness pass (spike steps.ts S1a: accounts.create rejects
+   * SYNC_REQUIRED until local chain state is coherent, "after explicit
+   * sync"). Never rejects — the caller's create/SYNC_REQUIRED path decides;
+   * timeoutMs only caps endpoint latency, not scan completion. */
+  async syncFresh(timeoutMs: number): Promise<void> {
+    try {
+      await this.client.sync({ signal: AbortSignal.timeout(timeoutMs) });
+    } catch {
+      // aborted or transient transport; freshness precondition re-checked at create
+    }
   }
 
   async listOperations(): Promise<readonly EngineOperation[]> {

@@ -19,8 +19,9 @@ export type EngineErrorCode =
   | 'NETWORK_MISMATCH'
   | 'TRANSPORT_ERROR'
   | 'SIGNER_REQUIRED'
+  | 'SYNC_REQUIRED'
   | 'TIMEOUT'
-  | 'UNKNOWN';
+  | 'UNKNOWN'
 
 export class EngineError extends Error {
   readonly code: EngineErrorCode;
@@ -134,6 +135,12 @@ export interface EngineWallet {
   getHistory(accountId: string, limit?: number): Promise<readonly EngineHistoryEntry[]>;
   watchSync(): AsyncIterable<EngineSyncStatus>;
   startSync(): Promise<void>;
+  /**
+   * Bounded tip-freshness pass for mutation preconditions (accounts.create
+   * rejects SYNC_REQUIRED on stale local chain state). Never rejects; the
+   * timeout is an upper bound on endpoint latency, not a scan budget.
+   */
+  syncFresh(timeoutMs: number): Promise<void>;
   listOperations(): Promise<readonly EngineOperation[]>;
   close(): Promise<void>;
 }

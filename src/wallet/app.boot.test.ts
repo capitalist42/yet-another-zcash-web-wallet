@@ -104,9 +104,13 @@ describe('boot choreography', () => {
     await booted;
     const calls = engine.lastWallet().calls;
     const balanceAt = calls.indexOf('getBalance');
+    const watchAt = calls.indexOf('watchSync');
     const startSyncAt = calls.indexOf('startSync');
     expect(balanceAt).toBeGreaterThan(-1);
-    expect(startSyncAt).toBeGreaterThan(balanceAt);
+    // watch stream only publishes on scan-revision change: subscribe before
+    // triggering sync or the first progress ticks are lost
+    expect(watchAt).toBeGreaterThan(balanceAt);
+    expect(startSyncAt).toBeGreaterThan(watchAt);
     expect(app.recovered.get()).toBe(true);
     expect(app.canSpend.get()).toBe(true);
     expect(app.balances.get()?.sapling).toBe(5n);
@@ -158,13 +162,16 @@ describe('boot choreography', () => {
     expect(engine.lastWallet().calls.filter((c) => c === 'mintAddress')).toHaveLength(1);
   });
 
-  it('view-only wallet: synced, funded display, no spend capability', async () => {
+  it('view-only wallet: synced, funded display, no spend capability, never mints', async () => {
     await registry.add(row({ id: 'v', kind: 'viewonly' }));
     engine.queueWallet({ accounts: [{ id: 'acct-1', viewOnly: true }] });
     await app.boot();
     expect(app.walletInfo.get()?.kind).toBe('viewonly');
     expect(app.canSpend.get()).toBe(false);
     expect(app.recovered.get()).toBe(true);
+    // mint needs a spend key; the SDK rejects it for view-only accounts
+    expect(engine.lastWallet().calls).not.toContain('mintAddress');
+    expect(app.address.get()).toBeNull();
     expect(engine.lastWallet().calls).toContain('startSync');
   });
 
