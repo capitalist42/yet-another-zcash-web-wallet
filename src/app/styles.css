@@ -1,0 +1,141 @@
+/* Deliberately minimal: legible dark surface, no framework. */
+:root {
+  color-scheme: dark;
+  --fg: #e8e8e8;
+  --muted: #9a9a9a;
+  --accent: #2eca7b;
+  --error: #ff6b6b;
+  --surface: #16181d;
+  --border: #2c2f36;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font: 15px/1.5 system-ui, sans-serif;
+  background: var(--surface);
+  color: var(--fg);
+}
+.app {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 16px;
+}
+h1 {
+  font-size: 1.25rem;
+  margin: 0.25rem 0;
+}
+h2 {
+  font-size: 1rem;
+  margin: 0.75rem 0 0.25rem;
+}
+.muted {
+  color: var(--muted);
+}
+.error {
+  color: var(--error);
+}
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.chip {
+  display: inline-block;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 8px;
+  font-size: 0.75rem;
+  margin-left: 6px;
+}
+.chip.warn {
+  border-color: var(--accent);
+}
+button {
+  background: var(--accent);
+  border: 0;
+  border-radius: 6px;
+  color: #06281a;
+  font-weight: 600;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.tabs button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+.tabs button.on {
+  border-color: var(--accent);
+}
+label {
+  display: block;
+  margin: 8px 0;
+  color: var(--muted);
+}
+input,
+textarea {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  background: #0f1115;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font: inherit;
+}
+input[type='checkbox'] {
+  width: auto;
+  display: inline;
+}
+.balances {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+.balances li {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+.address {
+  word-break: break-all;
+  background: #0f1115;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+}
+.phrase {
+  columns: 3;
+  padding-left: 1.2rem;
+}
+.gate {
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+
+.history {
+  list-style: none;
+  padding: 0;
+}
+.history li {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 0;
+}
+.in {
+  color: var(--accent);
+}
+.out {
+  color: var(--error);
+}

@@ -19,12 +19,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 const ENDPOINT = process.env.YAW_ENDPOINT ?? 'https://zcash-mainnet.chainsafe.dev';
 const PROXY_NETWORK = process.env.YAW_NETWORK === 'testnet' ? 'testnet' : 'mainnet';
 const HANG_PATH = decodeURIComponent(new URL('drill/HANG', import.meta.url).pathname);
-// Spike-only deviation from plan §1 ("no COOP/COEP"): the drill host sends
-// isolation headers so `crossOriginIsolated === true` and the engine's
-// threaded (SharedArrayBuffer) path is what gets qualified. Product config
-// stays COOP/COEP-free (plan §1 / Verification #8); YAW_ISOLATE=0 drops the
-// headers to re-qualify the single-threaded path against `vite preview`.
-const ISOLATE = process.env.YAW_ISOLATE !== '0';
+// Spike-only deviation from plan §1 ("no COOP/COEP"): the S4 drill qualifies
+// the engine's threaded (SharedArrayBuffer) path, which needs
+// `crossOriginIsolated === true`. The PRODUCT pages (plan §1 / Verification #8)
+// ship header-free by default; a spike drill run opts in with YAW_ISOLATE=1:
+//   YAW_ISOLATE=1 npm run preview  (then YAW_APP=…/spike.html node scripts/drill.mjs)
+const ISOLATE = process.env.YAW_ISOLATE === '1';
 const COOP_COEP: Record<string, string> = ISOLATE
   ? {
       'Cross-Origin-Opener-Policy': 'same-origin',
@@ -159,5 +159,9 @@ export default defineConfig(() => ({
   build: {
     target: 'esnext',
     assetsInlineLimit: 0,
+    rollupOptions: {
+      // product at /, spike qualification page at /spike.html
+      input: { main: 'index.html', spike: 'spike.html' },
+    },
   },
 }));

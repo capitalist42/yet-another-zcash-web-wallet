@@ -1,9 +1,10 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import SpikeApp from './spike/SpikeApp';
+import App from './app/App';
+import './app/styles.css';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <SpikeApp />
+    <App />
   </StrictMode>,
 );

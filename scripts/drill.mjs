@@ -35,7 +35,9 @@ if (CHROME === undefined) {
 }
 
 const APP = process.env.YAW_APP ?? 'http://127.0.0.1:4173/';
-// Extra query for the app page, e.g. YAW_APP_QUERY=network=testnet&endpoint=…
+// The spike page moved to /spike.html when the product took the root path;
+// the drill toggle endpoints (${APP}drill/…) stay at the base.
+const PAGE = process.env.YAW_PAGE ?? 'spike.html';
 // (the run target otherwise defaults to mainnet).
 const APP_QUERY = process.env.YAW_APP_QUERY ?? '';
 // Button substrings (unique) per step.
@@ -74,7 +76,7 @@ page.on('console', (m) => {
 });
 page.on('pageerror', (e) => console.log('[pageerror]', String(e).slice(0, 300)));
 
-await page.goto(APP_QUERY ? `${APP}?${APP_QUERY}` : APP, { waitUntil: 'networkidle' });
+await page.goto(PAGE ? `${APP}${PAGE}${APP_QUERY ? `?${APP_QUERY}` : ''}` : APP, { waitUntil: 'networkidle' });
 
 const button = (label) => page.locator('button', { hasText: label }).first();
 

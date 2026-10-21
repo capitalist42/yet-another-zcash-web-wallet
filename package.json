@@ -7,11 +7,15 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
+    "@nanostores/react": "^2.0.1",
     "@scure/bip39": "^1.6.0",
     "@zcashlabs/zcash.js": "0.1.0-rc.5",
+    "nanostores": "^1.5.5",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
@@ -19,8 +23,10 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.1.0",
+    "fake-indexeddb": "^6.2.6",
     "playwright-core": "1.58.2",
     "typescript": "~5.9.3",
-    "vite": "8.2.2"
+    "vite": "8.2.2",
+    "vitest": "^5.0.5"
   }
 }

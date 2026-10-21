@@ -1,0 +1,418 @@
+// The Wallet app service: boot choreography + onboarding flows + UI stores.
+// Everything engine-shaped goes through the port; this module is the single
+// orchestrator the React tree subscribes to (nanostores).
+import { atom, type ReadableAtom, type WritableAtom } from 'nanostores';
+import type {
+  Engine,
+  EngineBalance,
+  EngineHistoryEntry,
+  EngineSyncStatus,
+  EngineWallet,
+  NetworkId,
+} from './engine/port';
+import { EngineError, isNonTerminal } from './engine/port';
+import type { Registry, WalletKind, WalletRecord } from './registry';
+import { storageName, type EndpointSettings } from './policy';
+import { fingerprintFromUfvk } from './fingerprint';
+import { generatePhrase, normalizePhrase, phraseBytes, zeroize } from './keys';
+
+export type Screen = 'booting' | 'welcome' | 'wallet' | 'storage-busy';
+
+export interface WalletInfo {
+  readonly id: string;
+  readonly name: string;
+  readonly fingerprint: string;
+  readonly kind: WalletKind;
+}
+
+export interface CreateSession {
+  readonly phrase: string;
+}
+
+export type RestoreBirthday = 'fullScan' | { readonly kind: 'height'; readonly height: number };
+
+export interface ImportResult {
+  readonly ok: boolean;
+  readonly code?: string;
+  readonly message?: string;
+}
+
+export interface SpendGuard {
+  readonly ok: boolean;
+  readonly reason?: 'view-only' | 'unavailable';
+}
+
+export interface WalletApp {
+  // --- stores (UI subscribes; tests assert) --------------------------------
+  readonly screen: ReadableAtom<Screen>;
+  readonly network: WritableAtom<NetworkId>;
+  readonly walletInfo: ReadableAtom<WalletInfo | null>;
+  readonly balances: ReadableAtom<EngineBalance | null>;
+  readonly sync: ReadableAtom<EngineSyncStatus | null>;
+  readonly address: ReadableAtom<string | null>;
+  readonly pendingCount: ReadableAtom<number>;
+  /** Startup recovery finished (boot gate): payment paths unlock after. */
+  readonly recovered: ReadableAtom<boolean>;
+  /** Spend-capable = spend authority exists AND recovery completed (#4). */
+  readonly canSpend: ReadableAtom<boolean>;
+  readonly bootError: ReadableAtom<string | null>;
+  // --- flows ----------------------------------------------------------------
+  boot(): Promise<void>;
+  setNetwork(network: NetworkId): Promise<void>;
+  readonly onCreate: {
+    generate(): Promise<CreateSession>;
+    confirmBackup(phrase: string): Promise<ImportResult>;
+  };
+  readonly onRestore: {
+    restore(args: {
+      phrase: string;
+      passphrase?: string;
+      accountIndex: number;
+      birthday: RestoreBirthday;
+      name?: string;
+    }): Promise<ImportResult>;
+  };
+  readonly onViewOnly: {
+    import(args: { viewingKey: string; birthday: RestoreBirthday; name?: string }): Promise<ImportResult>;
+  };
+  /** Capability gate the Send surface must pass before composing (#4). */
+  guardSpend(): SpendGuard;
+  history(): Promise<readonly EngineHistoryEntry[]>;
+}
+
+export interface WalletAppDeps {
+  readonly engine: Engine;
+  readonly registry: Registry;
+  readonly endpoints: EndpointSettings;
+  /** navigator.storage.persist() — OPFS eviction guard, requested at creation. */
+  requestPersist(): Promise<boolean>;
+  /** test seam: capture engine-fed secret bytes to assert zeroization */
+  traceSecret?(bytes: Uint8Array): void;
+}
+
+const asResult = (e: unknown): ImportResult => {
+  if (e instanceof EngineError) return { ok: false, code: e.code, message: e.message };
+  return { ok: false, code: 'UNKNOWN', message: e instanceof Error ? e.message : String(e) };
+};
+
+/** Testnet-first default; `?network=mainnet` switches the fresh-browser default. */
+const defaultNetwork = (): NetworkId => {
+  try {
+    return new URLSearchParams(globalThis.location?.search ?? '').get('network') === 'mainnet'
+      ? 'mainnet'
+      : 'testnet';
+  } catch {
+    return 'testnet';
+  }
+};
+
+export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
+  const screen = atom<Screen>('booting');
+  const network = atom<NetworkId>(defaultNetwork());
+  const walletInfo = atom<WalletInfo | null>(null);
+  const balances = atom<EngineBalance | null>(null);
+  const sync = atom<EngineSyncStatus | null>(null);
+  const address = atom<string | null>(null);
+  const pendingCount = atom<number>(0);
+  const recovered = atom<boolean>(false);
+  const canSpend = atom<boolean>(false);
+  const bootError = atom<string | null>(null);
+
+  const traceSecret = deps.traceSecret ?? (() => undefined);
+
+  let wallet: EngineWallet | null = null;
+  let openSeq = 0;
+  let createPhrase: string | null = null;
+  let backupConfirmed = false;
+
+  const resetStores = (): void => {
+    walletInfo.set(null);
+    balances.set(null);
+    sync.set(null);
+    address.set(null);
+    pendingCount.set(0);
+    recovered.set(false);
+    canSpend.set(false);
+    bootError.set(null);
+  };
+
+  const closeWallet = async (): Promise<void> => {
+    openSeq += 1; // invalidate in-flight opens and watch loops
+    const w = wallet;
+    wallet = null;
+    if (w !== null) await w.close();
+  };
+
+  const refreshOperations = async (): Promise<void> => {
+    if (wallet === null) return;
+    const ops = await wallet.listOperations();
+    pendingCount.set(ops.filter((o) => isNonTerminal(o.phase)).length);
+  };
+
+  /** Watch the sync stream; refresh displayed state per progress tick. */
+  const watchLoop = async (w: EngineWallet): Promise<void> => {
+    try {
+      for await (const status of w.watchSync()) {
+        if (wallet !== w) break;
+        sync.set(status);
+        await refreshOperations();
+        const account = (await w.accounts())[0];
+        if (account !== undefined) balances.set(await w.getBalance(account.id));
+      }
+    } catch {
+      // closed or superseded; the next open owns the stores now
+    }
+  };
+
+  /**
+   * Finish opening a wallet whose Client is live: recovery is complete
+   * (it ran inside open), serve balances from the LOCAL DB, then start sync.
+   */
+  const finishOpen = async (w: EngineWallet, record: WalletRecord): Promise<void> => {
+    wallet = w;
+    recovered.set(true);
+    walletInfo.set({
+      id: record.id,
+      name: record.name,
+      fingerprint: record.fingerprint,
+      kind: record.kind,
+    });
+    canSpend.set(record.kind === 'seed');
+    const account = (await w.accounts())[0];
+    if (account !== undefined) {
+      balances.set(await w.getBalance(account.id));
+      const current = await w.currentAddress(account.id);
+      address.set(current ?? (await w.mintAddress(account.id)));
+      await refreshOperations();
+    }
+    await w.startSync();
+    void watchLoop(w);
+    await deps.registry.touch(record.id);
+    screen.set('wallet');
+  };
+
+  /**
+   * Boot order per issue #3 — registry → open last-used Wallet → await
+   * startup recovery (inside open) → balances from local DB → start sync.
+   */
+  const openWallet = async (record: WalletRecord): Promise<void> => {
+    const seq = openSeq;
+    screen.set('booting');
+    resetStores();
+    const w = await deps.engine.open({
+      network: record.network,
+      endpoint: deps.endpoints[record.network],
+      storageName: storageName(record.network, record.id),
+      allowTransparentSends: false, // Settings switch lands in #12; default off
+    });
+    if (seq !== openSeq) {
+      await w.close(); // superseded by a newer open (network switch)
+      return;
+    }
+    await finishOpen(w, record);
+  };
+
+  const boot = async (): Promise<void> => {
+    screen.set('booting');
+    const last = await deps.registry.lastUsed(network.get());
+    if (last === null) {
+      await closeWallet();
+      screen.set('welcome');
+      return;
+    }
+    try {
+      await openWallet(last);
+    } catch (e) {
+      if (e instanceof EngineError && e.code === 'STORAGE_BUSY') {
+        screen.set('storage-busy');
+        return;
+      }
+      bootError.set(e instanceof Error ? e.message : String(e));
+      screen.set('welcome');
+    }
+  };
+
+  const setNetwork = async (next: NetworkId): Promise<void> => {
+    if (next === network.get()) return;
+    network.set(next);
+    await closeWallet();
+    await boot();
+  };
+
+  /** Shared create/restore/import tail: open a FRESH-id client, materialize
+   * the account via `run` (returns the fingerprint source: UFVK or viewing
+   * key), register the row, and boot the just-opened client. */
+  const createWalletFlow = async (args: {
+    name: string;
+    kind: WalletKind;
+    run: (w: EngineWallet) => Promise<string>;
+  }): Promise<ImportResult> => {
+    const id = crypto.randomUUID();
+    let w: EngineWallet | null = null;
+    try {
+      w = await deps.engine.open({
+        network: network.get(),
+        endpoint: deps.endpoints[network.get()],
+        storageName: storageName(network.get(), id),
+        allowTransparentSends: false,
+      });
+      const fingerprintSource = await args.run(w);
+      const fingerprint = await fingerprintFromUfvk(fingerprintSource);
+      await deps.requestPersist();
+      await closeWallet();
+      wallet = w;
+      const record: WalletRecord = {
+        id,
+        network: network.get(),
+        name: args.name,
+        fingerprint,
+        kind: args.kind,
+        lastUsed: Date.now(),
+      };
+      await deps.registry.add(record);
+      await finishOpen(w, record);
+      return { ok: true };
+    } catch (e) {
+      if (w !== null) await w.close();
+      return asResult(e);
+    }
+  };
+
+  const onCreate = {
+    async generate(): Promise<CreateSession> {
+      const phrase = generatePhrase();
+      createPhrase = phrase;
+      backupConfirmed = false;
+      return { phrase };
+    },
+    /**
+     * Forced backup gate: only the phrase that re-matches the generated one
+     * creates + registers + opens the Wallet. No other path completes it.
+     */
+    async confirmBackup(phrase: string): Promise<ImportResult> {
+      if (backupConfirmed) return { ok: true }; // idempotent double-tap
+      if (createPhrase === null) return { ok: false, code: 'UNKNOWN', message: 'no phrase in flight' };
+      let normalized: string;
+      try {
+        normalized = normalizePhrase(phrase);
+      } catch (e) {
+        return { ok: false, code: 'INVALID_MNEMONIC', message: e instanceof Error ? e.message : String(e) };
+      }
+      if (normalized !== createPhrase) {
+        return { ok: false, code: 'INVALID_MNEMONIC', message: 'phrase mismatch' };
+      }
+      const bytes = phraseBytes(normalized);
+      traceSecret(bytes);
+      try {
+        const res = await createWalletFlow({
+          name: 'wallet',
+          kind: 'seed',
+          run: async (w) => {
+            const created = await w.createSeed({ mnemonic: bytes, name: 'wallet' });
+            const ufvk = await created.ufvk();
+            await created.dispose();
+            return ufvk;
+          },
+        });
+        if (res.ok) {
+          backupConfirmed = true;
+          createPhrase = null;
+        }
+        return res;
+      } finally {
+        zeroize(bytes);
+      }
+    },
+  };
+
+  const onRestore = {
+    async restore(args: {
+      phrase: string;
+      passphrase?: string;
+      accountIndex: number;
+      birthday: RestoreBirthday;
+      name?: string;
+    }): Promise<ImportResult> {
+      let phrase: string;
+      try {
+        phrase = normalizePhrase(args.phrase);
+      } catch (e) {
+        return { ok: false, code: 'INVALID_MNEMONIC', message: e instanceof Error ? e.message : String(e) };
+      }
+      const name = args.name ?? 'restored';
+      const bytes = phraseBytes(phrase);
+      const pass = args.passphrase === undefined || args.passphrase === '' ? undefined : phraseBytes(args.passphrase);
+      traceSecret(bytes);
+      if (pass !== undefined) traceSecret(pass);
+      try {
+        return await createWalletFlow({
+          name,
+          kind: 'seed',
+          run: async (w) => {
+            const birthday =
+              args.birthday === 'fullScan' ? ('fullScan' as const) : await w.resolveBirthday(args.birthday.height);
+            const created = await w.importSeed({
+              mnemonic: bytes,
+              ...(pass !== undefined ? { passphrase: pass } : {}),
+              accountIndex: args.accountIndex,
+              birthday,
+              name,
+            });
+            const ufvk = await created.ufvk();
+            await created.dispose();
+            return ufvk;
+          },
+        });
+      } finally {
+        zeroize(bytes);
+        if (pass !== undefined) zeroize(pass);
+      }
+    },
+  };
+
+  const onViewOnly = {
+    async import(args: { viewingKey: string; birthday: RestoreBirthday; name?: string }): Promise<ImportResult> {
+      const name = args.name ?? 'view-only';
+      return createWalletFlow({
+        name,
+        kind: 'viewonly',
+        run: async (w) => {
+          const birthday =
+            args.birthday === 'fullScan' ? ('fullScan' as const) : await w.resolveBirthday(args.birthday.height);
+          await w.importViewing({ viewingKey: args.viewingKey, birthday, name });
+          return args.viewingKey;
+        },
+      });
+    },
+  };
+
+  return {
+    screen,
+    network,
+    walletInfo,
+    balances,
+    sync,
+    address,
+    pendingCount,
+    recovered,
+    canSpend,
+    bootError,
+    boot,
+    setNetwork,
+    onCreate,
+    onRestore,
+    onViewOnly,
+    guardSpend(): SpendGuard {
+      const info = walletInfo.get();
+      if (info === null) return { ok: false, reason: 'unavailable' };
+      if (info.kind !== 'seed') return { ok: false, reason: 'view-only' };
+      if (!recovered.get()) return { ok: false, reason: 'unavailable' };
+      return { ok: true };
+    },
+    async history(): Promise<readonly EngineHistoryEntry[]> {
+      if (wallet === null) return [];
+      const account = (await wallet.accounts())[0];
+      return account === undefined ? [] : wallet.getHistory(account.id);
+    },
+  };
+};
