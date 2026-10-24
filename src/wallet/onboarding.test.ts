@@ -247,6 +247,24 @@ describe('backup gate is not dismissable', () => {
     expect(c.phrase).not.toBe(a.phrase);
     expect(app.backupPending.get()).toBe(true);
   });
+  it('survives a network switch mid-gate: refusal follows to the new network, phrase still completes', async () => {
+    const created = await app.onCreate.generate();
+    await app.setNetwork('mainnet');
+    expect(app.backupPending.get()).toBe(true);
+    const refused = await app.onRestore.restore({ phrase: FUNDED_PHRASE, accountIndex: 0, birthday: 'fullScan' });
+    expect(refused).toMatchObject({ ok: false, code: 'GATE_PENDING' });
+    // the same phrase is still the exit on the new network
+    expect((await app.onCreate.confirmBackup(created.phrase)).ok).toBe(true);
+    expect((await registry.list('mainnet'))[0]).toMatchObject({ kind: 'seed' });
+  });
+
+  it('boot that finds a Wallet leaves the gate closed', async () => {
+    await registry.add({ id: 'r1', network: 'testnet', name: 'w', fingerprint: 'abcd', kind: 'seed', lastUsed: 5 });
+    engine.queueWallet({ accounts: [{ id: 'acct-1' }] });
+    await app.boot();
+    expect(app.screen.get()).toBe('wallet');
+    expect(app.backupPending.get()).toBe(false);
+  });
 });
 
 describe('import validation (fake-engine seam, before any engine call)', () => {
