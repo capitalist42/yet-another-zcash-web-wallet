@@ -148,11 +148,15 @@ console.log(`leg 1 (restore, ${network})`);
   check(shown, 'restore reaches the wallet screen');
   if (shown) {
     const res = await waitForBalances(page);
-    check(res.ok, `balances match Zashi (${JSON.stringify(res.got).slice(0, 400)})`);
+    // got holds zats Bigints — stringify them for the failure echo.
+    const gotJson = JSON.stringify(res.got, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)).slice(0, 300);
+    check(res.ok, `balances match Zashi (${gotJson}${res.ok ? '' : ` err=${res.err}`})`);
     if (BIRTHDAY > 0 && res.ok) {
       const scanned = scannedFloor((await page.textContent('[aria-label="wallet"]')) ?? '');
       check(scanned !== null && scanned >= BIRTHDAY, `scan starts at birthday height (scanned=${scanned} >= ${BIRTHDAY})`);
     }
+    const body = (await page.textContent('body')) ?? '';
+    check(!/Unlock/.test(body), 'no Unlock affordance rendered');
     check((await page.textContent('[data-testid="receive-address"]'))?.trim().length > 0, 'receive address rendered');
   }
   check(errors.length === 0, `no page errors (${errors.slice(0, 2)})`);
@@ -185,15 +189,18 @@ console.log(`leg 2 (view-only, ${network})`);
     recovery: { mode: 'offline' },
   });
   let ufvk;
+  let secret;
+  let pass;
+  let signer;
   try {
-    const secret = new TextEncoder().encode(MNEMONIC.normalize('NFKD'));
-    const pass = PASSPHRASE === '' ? undefined : new TextEncoder().encode(PASSPHRASE);
-    const { signer } = await mem.accounts.import({
+    secret = new TextEncoder().encode(MNEMONIC.normalize('NFKD'));
+    pass = PASSPHRASE === '' ? undefined : new TextEncoder().encode(PASSPHRASE);
+    ({ signer } = await mem.accounts.import({
       accountIndex: 0,
       birthday: 'fullScan',
       mnemonic: secret,
       ...(pass === undefined ? {} : { passphrase: pass }),
-    });
+    }));
     const descriptor = await signer.getAccount({ network: net, selector: { kind: 'derived', accountIndex: 0 } });
     ufvk = await viewing.export({
       account: descriptor,
@@ -201,6 +208,9 @@ console.log(`leg 2 (view-only, ${network})`);
       acknowledge: 'discloses-viewing-authority',
     });
   } finally {
+    signer?.dispose?.();
+    secret?.fill(0);
+    pass?.fill(0);
     await mem.close();
   }
   const { browser, page, errors } = await launch();
@@ -219,7 +229,8 @@ console.log(`leg 2 (view-only, ${network})`);
   check(shown, 'view-only import reaches the wallet screen');
   if (shown) {
     const res = await waitForBalances(page);
-    check(res.ok, `balances match Zashi (${JSON.stringify(res.got).slice(0, 400)})`);
+    const gotJson = JSON.stringify(res.got, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)).slice(0, 300);
+    check(res.ok, `balances match Zashi (${gotJson}${res.ok ? '' : ` err=${res.err}`})`);
     const body = (await page.textContent('body')) ?? '';
     check(body.includes('View-only'), 'View-only chip rendered');
     // Scoped to the actions area and asserted non-empty, so a selector drift
@@ -234,6 +245,9 @@ console.log(`leg 2 (view-only, ${network})`);
     check((await page.textContent('[data-testid="receive-address"]'))?.trim().length > 0, 'receive address rendered');
   }
   check(errors.length === 0, `no page errors (${errors.slice(0, 2)})`);
+  // Same secret-before-screenshot rule as leg 1: on a failed leg the UFVK is
+  // still in the textarea (viewing authority — a secret by the header rule).
+  await form.locator('textarea').first().fill('').catch(() => {});
   await page.screenshot({ path: '/tmp/yaw-viewonly.png' });
   await browser.close();
 }

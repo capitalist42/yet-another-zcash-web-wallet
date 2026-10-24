@@ -61,6 +61,12 @@ derived UFVK shows the same balances with the View-only chip and no
 Send/Unlock affordances. Secrets come only from the environment and never
 hit disk or logs.
 
+Rehearsal (harness proof, NOT a compat claim): zero-funds abandon-vector
+seed, mainnet, birthday = tip−20 → both legs green end to end on
+2026-10-25 (scan floor 3 529 461 ≥ birthday; view-only chip, Send absent,
+no Unlock, receive address, zero page errors). This exercises the script —
+form fills, selectors, balance/scan assertions — without funds.
+
 - [ ] Funded mainnet seed: both legs green vs Zashi (the required
       cross-check before any restore-compat claim ships).
 
