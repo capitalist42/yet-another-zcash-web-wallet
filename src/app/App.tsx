@@ -186,6 +186,9 @@ function CreateFlow() {
       <button
         type="button"
         onClick={async () => {
+          // A fresh attempt never keeps the previous attempt's message —
+          // otherwise a stale .error element can outlive its cause.
+          setError(null);
           const res = await app.onCreate.confirmBackup(confirm);
           setError(res.ok ? null : (res.message ?? 'phrase mismatch'));
         }}
