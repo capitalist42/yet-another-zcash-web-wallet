@@ -306,6 +306,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       await finishOpen(w, record);
       return { ok: true };
     } catch (e) {
+      // Past closeWallet() the module pointer names THIS client; if a late
+      // step (registry.add, finishOpen) throws, never leave it dangling at
+      // the closed client we are about to close below.
+      if (wallet === w) wallet = null;
       if (w !== null) await w.close();
       return asResult(e);
     }

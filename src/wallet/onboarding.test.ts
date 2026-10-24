@@ -309,3 +309,32 @@ describe('import validation (fake-engine seam, before any engine call)', () => {
     expect(rows).toHaveLength(1);
   });
 });
+
+describe('failed flow leaves no dangling client (fake-engine seam)', () => {
+  it('a throw in late registration closes the client and clears the pointer', async () => {
+    // registry.add is the step AFTER the client is adopted (closeWallet();
+    // wallet = w). If it throws, the app must not keep serving from — or
+    // pointing at — the closed client.
+    const brokenRegistry: Registry = {
+      ...registry,
+      add: async () => {
+        throw new Error('quota exceeded');
+      },
+    };
+    const app2 = createWalletApp({
+      engine: engine.engine,
+      registry: brokenRegistry,
+      endpoints: DEFAULT_ENDPOINTS,
+      requestPersist: async () => true,
+    });
+    const created = await app2.onCreate.generate();
+    const res = await app2.onCreate.confirmBackup(created.phrase);
+    expect(res).toMatchObject({ ok: false, code: 'UNKNOWN', message: 'quota exceeded' });
+    expect(engine.lastWallet().closed).toBe(true);
+    // consumer-visible contract: the History view polls app.history();
+    // a dangling pointer at the closed client would reject from defaultAccount
+    // with 'wallet closed' instead of reporting the honest empty list.
+    await expect(app2.history()).resolves.toEqual([]);
+    expect(await registry.list('testnet')).toHaveLength(0);
+  });
+});
