@@ -60,8 +60,11 @@ const network = process.argv[2] ?? 'testnet';
 const APP = `http://127.0.0.1:4173/?network=${network}`;
 const ZEC = 100_000_000n;
 const zats = (s) => {
-  const [w, f = ''] = String(s).split('.');
-  return BigInt(w) * ZEC + BigInt(f.padEnd(8, '0'));
+  const t = String(s).trim();
+  const neg = t.startsWith('-');
+  const [w, f = ''] = (neg ? t.slice(1) : t).split('.');
+  const v = BigInt(w === '' ? '0' : w) * ZEC + BigInt(f.padEnd(8, '0') || '0');
+  return neg ? -v : v;
 };
 const EXPECT_BAL = {
   transparent: zats(EXPECT.balances.transparent ?? '0'),
@@ -153,6 +156,11 @@ console.log(`leg 1 (restore, ${network})`);
     check((await page.textContent('[data-testid="receive-address"]'))?.trim().length > 0, 'receive address rendered');
   }
   check(errors.length === 0, `no page errors (${errors.slice(0, 2)})`);
+  // Wipe the secret fields before the evidence screenshot: on a failed leg the
+  // form (with the phrase) is still on screen, and screenshotting it would pin
+  // the mnemonic to disk — forbidden by the header invariant.
+  await form.locator('textarea').first().fill('').catch(() => {});
+  if (PASSPHRASE !== '') await form.locator('input[type="password"]').fill('').catch(() => {});
   await page.screenshot({ path: '/tmp/yaw-restore.png' });
   await browser.close();
 }
@@ -214,7 +222,13 @@ console.log(`leg 2 (view-only, ${network})`);
     check(res.ok, `balances match Zashi (${JSON.stringify(res.got).slice(0, 400)})`);
     const body = (await page.textContent('body')) ?? '';
     check(body.includes('View-only'), 'View-only chip rendered');
-    check(!body.includes('Send'), 'Send hidden for view-only Wallet');
+    // Scoped to the actions area and asserted non-empty, so a selector drift
+    // fails loudly instead of passing on an empty string; a body-wide 'Send'
+    // substring would also match future copy (e.g. 'Sender').
+    const actions = page.locator('[aria-label="wallet"] .actions');
+    check((await actions.count()) > 0, 'actions area present');
+    const actionText = (await actions.innerText().catch(() => '')) ?? '';
+    check(!/\bSend\b/.test(actionText), 'Send hidden for view-only Wallet (actions area)');
     check(body.includes('No spend authority'), 'view-only actions copy shown');
     check(!/Unlock/.test(body), 'no Unlock affordance rendered');
     check((await page.textContent('[data-testid="receive-address"]'))?.trim().length > 0, 'receive address rendered');

@@ -95,6 +95,11 @@ await page.fill('[aria-label="backup gate"] textarea', words.join(' '));
 await page.click('text=I saved my phrase');
 console.log('gate confirmed; waiting for wallet screen (wasm+OPFS+lightd)…');
 
+// The wrong-phrase attempt left an .error element on screen; the app clears it
+// when a new attempt starts, so let that flush land before racing on it again —
+// otherwise this race could observe the stale error and report a false failure.
+await page.waitForFunction(() => document.querySelector('.error') === null, { timeout: 5_000 }).catch(() => {});
+
 // Either the wallet screen appears, or an honest error shows up.
 const outcome = await Promise.race([
   page.waitForSelector('[aria-label="wallet"]', { timeout: 240_000 }).then(() => 'wallet'),
