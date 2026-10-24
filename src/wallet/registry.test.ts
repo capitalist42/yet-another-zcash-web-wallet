@@ -58,11 +58,4 @@ describe('registry (IndexedDB)', () => {
     await r.remove('b');
     expect(await r.get('b')).toBeNull();
   });
-
-  it('set patches fields without touching id', async () => {
-    const r = freshRegistry();
-    await r.add(row({ id: 'a', name: 'first' }));
-    await r.set('a', { name: 'renamed' });
-    expect(await r.get('a')).toMatchObject({ id: 'a', name: 'renamed' });
-  });
 });

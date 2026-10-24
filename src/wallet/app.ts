@@ -4,13 +4,14 @@
 import { atom, type ReadableAtom, type WritableAtom } from 'nanostores';
 import type {
   Engine,
+  EngineAccount,
   EngineBalance,
   EngineHistoryEntry,
   EngineSyncStatus,
   EngineWallet,
   NetworkId,
 } from './engine/port';
-import { EngineError, isNonTerminal } from './engine/port';
+import { EngineError, isNonTerminal, type EngineErrorCode } from './engine/port';
 import type { Registry, WalletKind, WalletRecord } from './registry';
 import { storageName, FRESHNESS_TIMEOUT_MS, type EndpointSettings } from './policy';
 import { fingerprintFromUfvk } from './fingerprint';
@@ -33,7 +34,7 @@ export type RestoreBirthday = 'fullScan' | { readonly kind: 'height'; readonly h
 
 export interface ImportResult {
   readonly ok: boolean;
-  readonly code?: string;
+  readonly code?: EngineErrorCode;
   readonly message?: string;
 }
 
@@ -46,6 +47,8 @@ export interface WalletApp {
   // --- stores (UI subscribes; tests assert) --------------------------------
   readonly screen: ReadableAtom<Screen>;
   readonly network: WritableAtom<NetworkId>;
+  /** Active lightwalletd endpoint; persistent chip (ADR-0001 disclosure). */
+  readonly endpoint: ReadableAtom<string>;
   readonly walletInfo: ReadableAtom<WalletInfo | null>;
   readonly balances: ReadableAtom<EngineBalance | null>;
   readonly sync: ReadableAtom<EngineSyncStatus | null>;
@@ -95,20 +98,16 @@ const asResult = (e: unknown): ImportResult => {
   return { ok: false, code: 'UNKNOWN', message: e instanceof Error ? e.message : String(e) };
 };
 
-/** Testnet-first default; `?network=mainnet` switches the fresh-browser default. */
-const defaultNetwork = (): NetworkId => {
-  try {
-    return new URLSearchParams(globalThis.location?.search ?? '').get('network') === 'mainnet'
-      ? 'mainnet'
-      : 'testnet';
-  } catch {
-    return 'testnet';
-  }
+/** Testnet-first default; `?network=mainnet|testnet` picks the boot Network. */
+export const networkFromQuery = (): NetworkId | null => {
+  const forced = new URLSearchParams(globalThis.location?.search ?? '').get('network');
+  return forced === 'mainnet' || forced === 'testnet' ? forced : null;
 };
 
 export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const screen = atom<Screen>('booting');
-  const network = atom<NetworkId>(defaultNetwork());
+  const network = atom<NetworkId>(networkFromQuery() ?? 'testnet');
+  const endpoint = atom<string>(deps.endpoints[network.get()]);
   const walletInfo = atom<WalletInfo | null>(null);
   const balances = atom<EngineBalance | null>(null);
   const sync = atom<EngineSyncStatus | null>(null);
@@ -143,6 +142,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (w !== null) await w.close();
   };
 
+  /** v1 rule: one default account per Wallet; switcher UI is #11. */
+  const defaultAccount = async (w: EngineWallet): Promise<EngineAccount | undefined> =>
+    (await w.accounts())[0];
+
   const refreshOperations = async (): Promise<void> => {
     if (wallet === null) return;
     const ops = await wallet.listOperations();
@@ -156,7 +159,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         if (wallet !== w) break;
         sync.set(status);
         await refreshOperations();
-        const account = (await w.accounts())[0];
+        const account = await defaultAccount(w);
         if (account !== undefined) balances.set(await w.getBalance(account.id));
       }
     } catch {
@@ -178,7 +181,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       kind: record.kind,
     });
     canSpend.set(record.kind === 'seed');
-    const account = (await w.accounts())[0];
+    const account = await defaultAccount(w);
     if (account !== undefined) {
       balances.set(await w.getBalance(account.id));
       const current = await w.currentAddress(account.id);
@@ -219,6 +222,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
 
   const boot = async (): Promise<void> => {
     screen.set('booting');
+    endpoint.set(deps.endpoints[network.get()]);
     const last = await deps.registry.lastUsed(network.get());
     if (last === null) {
       await closeWallet();
@@ -240,6 +244,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const setNetwork = async (next: NetworkId): Promise<void> => {
     if (next === network.get()) return;
     network.set(next);
+    endpoint.set(deps.endpoints[next]);
     await closeWallet();
     await boot();
   };
@@ -405,6 +410,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   return {
     screen,
     network,
+    endpoint,
     walletInfo,
     balances,
     sync,
@@ -427,7 +433,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     },
     async history(): Promise<readonly EngineHistoryEntry[]> {
       if (wallet === null) return [];
-      const account = (await wallet.accounts())[0];
+      const account = await defaultAccount(wallet);
       return account === undefined ? [] : wallet.getHistory(account.id);
     },
   };

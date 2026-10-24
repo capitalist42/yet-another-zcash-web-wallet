@@ -95,6 +95,7 @@ function WalletScreen() {
   const address = useStore(app.address);
   const pending = useStore(app.pendingCount);
   const canSpend = useStore(app.canSpend);
+  const endpoint = useStore(app.endpoint);
   const network = useStore(app.network);
   if (info === null) return null;
   return (
@@ -103,6 +104,8 @@ function WalletScreen() {
         <h1>
           {info.name} <span className="chip">{info.fingerprint}</span>
           {info.kind === 'viewonly' && <span className="chip">View-only</span>}
+          {/* ADR-0001: the endpoint operator is a party to your privacy. */}
+          <span className="chip">{new URL(endpoint).host}</span>
         </h1>
         <button type="button" onClick={() => void app.setNetwork(network === 'testnet' ? 'mainnet' : 'testnet')}>
           Switch to {network === 'testnet' ? 'mainnet' : 'testnet'}
@@ -268,6 +271,8 @@ function WelcomeScreen() {
   return (
     <section className="screen" aria-label="welcome">
       <h1>Zcash Wallet</h1>
+      {/* ADR-0001: one-sentence onboarding disclosure. */}
+      <p className="muted">Your lightwalletd provider can see your activity.</p>
       {error !== null && <p className="error">{error}</p>}
       <nav className="tabs">
         <button type="button" className={tab === 'create' ? 'on' : ''} onClick={() => setTab('create')}>

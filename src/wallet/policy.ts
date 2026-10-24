@@ -7,7 +7,9 @@ import type { NetworkId } from './engine/port';
 
 export interface FrozenPolicy {
   readonly spendPools: readonly ('transparent' | 'sapling' | 'ironwood')[];
-  readonly transparent: 'disallow' | 'allow-owned';
+  /** ADR-0005: 'allow-owned' forever — 'disallow' starves shielding's owned
+   * transparent spend and cannot ship; not a configurable axis. */
+  readonly transparent: 'allow-owned';
   readonly changePool: 'sapling' | 'ironwood';
   readonly feeRule: 'zip317-standard';
   readonly confirmations: {

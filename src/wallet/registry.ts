@@ -29,7 +29,6 @@ export interface Registry {
   list(network: WalletRecord['network']): Promise<WalletRecord[]>;
   get(id: string): Promise<WalletRecord | null>;
   remove(id: string): Promise<void>;
-  set(id: string, patch: Partial<Omit<WalletRecord, 'id'>>): Promise<void>;
 }
 
 export const createRegistry = (store: RegistryStore): Registry => ({
@@ -59,11 +58,6 @@ export const createRegistry = (store: RegistryStore): Registry => ({
   },
   async remove(id) {
     await store.remove(id);
-  },
-  async set(id, patch) {
-    const all = await store.getAll();
-    const rec = all.find((r) => r.id === id);
-    if (rec !== undefined) await store.put({ ...rec, ...patch, id: rec.id });
   },
 });
 
