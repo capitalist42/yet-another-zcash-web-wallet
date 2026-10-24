@@ -116,6 +116,18 @@ describe('boot choreography', () => {
     expect(app.balances.get()?.sapling).toBe(5n);
   });
 
+  it('payment paths stay gated until recovery completes', async () => {
+    await registry.add(row({ id: 'a' }));
+    engine.queueWallet({ holdOpen: true, accounts: [{ id: 'acct-1' }] });
+    const booted = app.boot();
+    await engine.openStarted(); // startup recovery still in flight
+    expect(app.recovered.get()).toBe(false);
+    expect(app.guardSpend()).toEqual({ ok: false, reason: 'unavailable' });
+    engine.pending().releaseOpen();
+    await booted;
+    expect(app.guardSpend()).toEqual({ ok: true });
+  });
+
   it('sync progress flows from the watch stream into the store', async () => {
     await registry.add(row({ id: 'a' }));
     engine.queueWallet({ accounts: [{ id: 'acct-1' }] });
