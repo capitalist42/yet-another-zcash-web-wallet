@@ -131,7 +131,9 @@ function WalletScreen() {
       <div className="receive">
         <h2>Receive Address</h2>
         <p className="address" data-testid="receive-address">
-          {address ?? 'preparing…'}
+          {address ?? (info.kind === 'viewonly'
+            ? 'No current address — view-only Wallets cannot mint one.'
+            : 'preparing…')}
         </p>
       </div>
       <div className="actions">
