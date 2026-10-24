@@ -22,9 +22,11 @@ Qualification run 2026-10-21 (headless Chromium via `node scripts/live.mjs
       create surfaces `SYNC_REQUIRED` after the single retry — honest, no
       silent corruption. Remove this line when the SDK ships NU7 support.
 - [ ] Restore from a funded seed and see real balances after scan (mainnet
-      funds required; also the Zashi cross-check below).
+      funds required; also the Zashi cross-check below). Run via the
+      operator leg: scripts/restore-viewonly.mjs (see its section).
 - [ ] View-only import of a UFVK belonging to a funded mainnet account:
       history and balances render, Send remains unavailable, no mint.
+      Same operator leg (leg 2 derives the UFVK offline from the phrase).
 
 ## Zashi cross-check (issue #4 AC)
 - [ ] Create in Zashi, restore the same phrase here (and vice versa):
@@ -41,3 +43,30 @@ Qualification run 2026-10-21 (headless Chromium via `node scripts/live.mjs
       (scripts/live.mjs).
 - [ ] Network toggle: switch testnet↔mainnet; the old client closes, the new
       network's registry row boots.
+
+## Restore / view-only operator legs (scripts/restore-viewonly.mjs)
+The two issue-#4 ACs that need operator secrets, driven through the product
+UI in real Chromium (fresh profile per leg). The UFVK for leg 2 is derived
+OFFLINE from the same phrase (pure key material — zero network calls):
+
+    ZCASH_MNEMONIC="all 24 words" [ZCASH_PASSPHRASE=…] \
+      ZCASH_EXPECT='{"birthdayHeight":N,"balances":{"transparent":"…","sapling":"…","ironwood":"…"}}' \
+      node scripts/restore-viewonly.mjs [network]   # against npm run preview
+
+`ZCASH_EXPECT` is the Zashi-side truth for that seed at that birthday — the
+cross-check that gates the restore-compat claim (issue #4 AC2). The script
+asserts: restore reaches the wallet screen, balances equal Zashi exactly,
+the scan floor is ≥ the birthday height, and the view-only import of the
+derived UFVK shows the same balances with the View-only chip and no
+Send/Unlock affordances. Secrets come only from the environment and never
+hit disk or logs.
+
+- [ ] Funded mainnet seed: both legs green vs Zashi (the required
+      cross-check before any restore-compat claim ships).
+
+## Forced backup gate (asserted by scripts/live.mjs on every run)
+- [x] While a generated phrase awaits confirmation, the Restore/View-only
+      tabs are disabled and the service refuses both paths (`GATE_PENDING`);
+      a wrong phrase keeps the gate pending — no dismiss path exists.
+      Qualified live on mainnet 2026-10-25 (real engine, wallet screen after
+      the correct phrase, zero page errors).

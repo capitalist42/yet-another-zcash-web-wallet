@@ -32,9 +32,12 @@ export interface CreateSession {
 
 export type RestoreBirthday = 'fullScan' | { readonly kind: 'height'; readonly height: number };
 
+/** App-level result codes: engine codes plus the onboarding gate refusal. */
+export type ImportErrorCode = EngineErrorCode | 'GATE_PENDING';
+
 export interface ImportResult {
   readonly ok: boolean;
-  readonly code?: EngineErrorCode;
+  readonly code?: ImportErrorCode;
   readonly message?: string;
 }
 
@@ -58,6 +61,9 @@ export interface WalletApp {
   readonly recovered: ReadableAtom<boolean>;
   /** Spend-capable = spend authority exists AND recovery completed (#4). */
   readonly canSpend: ReadableAtom<boolean>;
+  /** Forced backup gate is open: a generated phrase awaits confirmation.
+   * While true, every other onboarding path is refused (#4: not dismissable). */
+  readonly backupPending: ReadableAtom<boolean>;
   readonly bootError: ReadableAtom<string | null>;
   // --- flows ----------------------------------------------------------------
   boot(): Promise<void>;
@@ -98,6 +104,11 @@ const asResult = (e: unknown): ImportResult => {
   return { ok: false, code: 'UNKNOWN', message: e instanceof Error ? e.message : String(e) };
 };
 
+/** Birthday choice guard (Restore + View-only, 4 call sites): an explicit
+ * height must be a whole block height ≥ 1 before any engine call. */
+const validBirthday = (b: RestoreBirthday): boolean =>
+  b === 'fullScan' || (Number.isInteger(b.height) && b.height >= 1);
+
 /** Testnet-first default; `?network=mainnet|testnet` picks the boot Network. */
 export const networkFromQuery = (): NetworkId | null => {
   const forced = new URLSearchParams(globalThis.location?.search ?? '').get('network');
@@ -115,6 +126,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const pendingCount = atom<number>(0);
   const recovered = atom<boolean>(false);
   const canSpend = atom<boolean>(false);
+  const backupPending = atom<boolean>(false);
   const bootError = atom<string | null>(null);
 
   const traceSecret = deps.traceSecret ?? (() => undefined);
@@ -300,10 +312,15 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   };
 
   const onCreate = {
+    /** Idempotent while the gate is pending: re-issue the SAME phrase, so
+     * re-clicking Create can neither spawn a second session nor lose the
+     * gate (#4: cannot dismiss). */
     async generate(): Promise<CreateSession> {
+      if (createPhrase !== null) return { phrase: createPhrase };
       const phrase = generatePhrase();
       createPhrase = phrase;
       backupConfirmed = false;
+      backupPending.set(true);
       return { phrase };
     },
     /**
@@ -338,6 +355,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         if (res.ok) {
           backupConfirmed = true;
           createPhrase = null;
+          backupPending.set(false);
         }
         return res;
       } finally {
@@ -354,6 +372,13 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       birthday: RestoreBirthday;
       name?: string;
     }): Promise<ImportResult> {
+      // #4: a pending forced-backup gate blocks every other onboarding path.
+      if (backupPending.get())
+        return { ok: false, code: 'GATE_PENDING', message: 'Confirm your backup phrase first — it cannot be left pending.' };
+      if (!Number.isInteger(args.accountIndex) || args.accountIndex < 0)
+        return { ok: false, code: 'INVALID_ARGUMENT', message: 'Account index must be a whole number ≥ 0' };
+      if (!validBirthday(args.birthday))
+        return { ok: false, code: 'INVALID_ARGUMENT', message: 'Birthday height must be a whole number ≥ 1' };
       let phrase: string;
       try {
         phrase = normalizePhrase(args.phrase);
@@ -393,6 +418,13 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
 
   const onViewOnly = {
     async import(args: { viewingKey: string; birthday: RestoreBirthday; name?: string }): Promise<ImportResult> {
+      if (backupPending.get())
+        return { ok: false, code: 'GATE_PENDING', message: 'Confirm your backup phrase first — it cannot be left pending.' };
+      const viewingKey = args.viewingKey.trim();
+      if (viewingKey.length === 0)
+        return { ok: false, code: 'INVALID_ARGUMENT', message: 'Viewing key is required' };
+      if (!validBirthday(args.birthday))
+        return { ok: false, code: 'INVALID_ARGUMENT', message: 'Birthday height must be a whole number ≥ 1' };
       const name = args.name ?? 'view-only';
       return createWalletFlow({
         name,
@@ -400,8 +432,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         run: async (w) => {
           const birthday =
             args.birthday === 'fullScan' ? ('fullScan' as const) : await w.resolveBirthday(args.birthday.height);
-          await w.importViewing({ viewingKey: args.viewingKey, birthday, name });
-          return args.viewingKey;
+          await w.importViewing({ viewingKey, birthday, name });
+          return viewingKey;
         },
       });
     },
@@ -418,6 +450,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     pendingCount,
     recovered,
     canSpend,
+    backupPending,
     bootError,
     boot,
     setNetwork,

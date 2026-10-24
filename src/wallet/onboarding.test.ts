@@ -220,3 +220,74 @@ describe('view-only capability gating', () => {
     expect(await app.history()).toHaveLength(0);
   });
 });
+
+describe('backup gate is not dismissable', () => {
+  it('other onboarding paths are refused while a gate is pending', async () => {
+    const created = await app.onCreate.generate();
+    expect(app.backupPending.get()).toBe(true);
+    const r1 = await app.onRestore.restore({ phrase: FUNDED_PHRASE, accountIndex: 0, birthday: 'fullScan' });
+    expect(r1).toMatchObject({ ok: false, code: 'GATE_PENDING' });
+    const r2 = await app.onViewOnly.import({ viewingKey: 'uview1abc123', birthday: 'fullScan' });
+    expect(r2).toMatchObject({ ok: false, code: 'GATE_PENDING' });
+    // nothing escaped the gate: no wallet, no engine open
+    expect(await registry.list('testnet')).toHaveLength(0);
+    expect(engine.opens).toHaveLength(0);
+    expect(app.backupPending.get()).toBe(true);
+    // the only exit is still the phrase
+    expect((await app.onCreate.confirmBackup(created.phrase)).ok).toBe(true);
+    expect(app.backupPending.get()).toBe(false);
+  });
+
+  it('generate during a pending gate resumes the same session; after completion, a new phrase', async () => {
+    const a = await app.onCreate.generate();
+    const b = await app.onCreate.generate(); // double-tap: no second phrase, no lost gate
+    expect(b.phrase).toBe(a.phrase);
+    await app.onCreate.confirmBackup(a.phrase);
+    const c = await app.onCreate.generate(); // completed gate: fresh session allowed
+    expect(c.phrase).not.toBe(a.phrase);
+    expect(app.backupPending.get()).toBe(true);
+  });
+});
+
+describe('import validation (fake-engine seam, before any engine call)', () => {
+  it('restore rejects a bad accountIndex without opening anything', async () => {
+    for (const accountIndex of [-1, 1.5, Number.NaN]) {
+      const res = await app.onRestore.restore({ phrase: FUNDED_PHRASE, accountIndex, birthday: 'fullScan' });
+      expect(res).toMatchObject({ ok: false, code: 'INVALID_ARGUMENT' });
+    }
+    expect(engine.opens).toHaveLength(0);
+    expect(await registry.list('testnet')).toHaveLength(0);
+  });
+
+  it('restore rejects a bad birthday height without opening anything', async () => {
+    for (const height of [0, -1, 12.5, Number.NaN]) {
+      const res = await app.onRestore.restore({
+        phrase: FUNDED_PHRASE,
+        accountIndex: 0,
+        birthday: { kind: 'height', height },
+      });
+      expect(res).toMatchObject({ ok: false, code: 'INVALID_ARGUMENT' });
+    }
+    expect(engine.opens).toHaveLength(0);
+  });
+
+  it('view-only rejects a blank viewing key and bad height without opening anything', async () => {
+    for (const viewingKey of ['', '   ']) {
+      const res = await app.onViewOnly.import({ viewingKey, birthday: 'fullScan' });
+      expect(res).toMatchObject({ ok: false, code: 'INVALID_ARGUMENT' });
+    }
+    const bad = await app.onViewOnly.import({
+      viewingKey: 'uview1abc123',
+      birthday: { kind: 'height', height: Number.NaN },
+    });
+    expect(bad).toMatchObject({ ok: false, code: 'INVALID_ARGUMENT' });
+    expect(engine.opens).toHaveLength(0);
+  });
+
+  it('view-only import trims surrounding whitespace off the key', async () => {
+    const res = await app.onViewOnly.import({ viewingKey: '  uview1abc123\n', birthday: 'fullScan' });
+    expect(res.ok).toBe(true);
+    const rows = await registry.list('testnet');
+    expect(rows).toHaveLength(1);
+  });
+});

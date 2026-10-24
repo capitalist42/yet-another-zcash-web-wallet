@@ -63,6 +63,26 @@ await page.waitForFunction(
   () => document.querySelectorAll('[aria-label="backup gate"] ol.phrase li').length === 24,
   { timeout: 30_000 },
 );
+// Forced backup gate (#4): while it is pending, the other onboarding paths
+// are visibly unavailable (the service refuses them too).
+const tabLocked = async (name) =>
+  await page.$eval(`.tabs button:has-text("${name}")`, (el) => el.disabled);
+if (!(await tabLocked('Restore')) || !(await tabLocked('View-only'))) {
+  console.error('tabs NOT locked while the backup gate is pending');
+  process.exit(4);
+}
+console.log('backup gate pending: Restore/View-only tabs disabled');
+
+// A wrong phrase must not dismiss the gate either.
+await page.fill('[aria-label="backup gate"] textarea', 'wrong words here');
+await page.click('text=I saved my phrase');
+await page.waitForSelector('.error', { timeout: 10_000 });
+if (!(await tabLocked('Restore')) || !(await tabLocked('View-only'))) {
+  console.error('tabs unlocked after a wrong-phrase attempt');
+  process.exit(4);
+}
+console.log('wrong phrase rejected; gate still pending');
+
 const words = await page.$$eval('[aria-label="backup gate"] ol.phrase li', (lis) =>
   lis.map((li) => li.textContent.trim().replace(/^\d+\s+/, '')),
 );

@@ -268,6 +268,9 @@ function ViewOnlyFlow() {
 function WelcomeScreen() {
   const [tab, setTab] = useState<'create' | 'restore' | 'viewonly'>('create');
   const error = useStore(app.bootError);
+  // Forced backup gate (#4): while a phrase awaits confirmation, the other
+  // onboarding paths are visibly unavailable — the service refuses them too.
+  const gatePending = useStore(app.backupPending);
   return (
     <section className="screen" aria-label="welcome">
       <h1>Zcash Wallet</h1>
@@ -278,10 +281,22 @@ function WelcomeScreen() {
         <button type="button" className={tab === 'create' ? 'on' : ''} onClick={() => setTab('create')}>
           Create
         </button>
-        <button type="button" className={tab === 'restore' ? 'on' : ''} onClick={() => setTab('restore')}>
+        <button
+          type="button"
+          className={tab === 'restore' ? 'on' : ''}
+          disabled={gatePending}
+          title={gatePending ? 'Confirm your backup phrase first' : undefined}
+          onClick={() => setTab('restore')}
+        >
           Restore
         </button>
-        <button type="button" className={tab === 'viewonly' ? 'on' : ''} onClick={() => setTab('viewonly')}>
+        <button
+          type="button"
+          className={tab === 'viewonly' ? 'on' : ''}
+          disabled={gatePending}
+          title={gatePending ? 'Confirm your backup phrase first' : undefined}
+          onClick={() => setTab('viewonly')}
+        >
           View-only
         </button>
       </nav>
