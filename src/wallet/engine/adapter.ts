@@ -7,6 +7,7 @@ import {
   createWalletClient,
   isZcashError,
   resolveBirthday,
+  txId,
   viewing,
   type AccountId,
   type AccountRecord,
@@ -35,6 +36,7 @@ import type {
   EngineSeedAccount,
   EngineSendResult,
   EngineSyncStatus,
+  EngineTransactionOutput,
   EngineWallet,
   OpenSpec,
 } from './port';
@@ -128,12 +130,14 @@ const mapHistory = (h: {
   blockTime: number | null;
   balanceDelta: bigint;
   pools: readonly string[];
+  isShielding: boolean | null;
 }): EngineHistoryEntry => ({
   txid: h.txid,
   minedHeight: h.minedHeight,
   blockTime: h.blockTime,
   balanceDelta: h.balanceDelta,
   pools: h.pools,
+  isShielding: h.isShielding,
 });
 
 class AdapterWallet implements EngineWallet {
@@ -277,6 +281,32 @@ class AdapterWallet implements EngineWallet {
     try {
       const record = await this.client.addresses.next({ accountId: accountId as AccountId });
       return record.address;
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  async listAddresses(accountId: string): Promise<readonly string[]> {
+    try {
+      const records = await this.client.addresses.list({ accountId: accountId as AccountId });
+      return records.map((r) => r.address);
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  async listTransactionOutputs(txid: string): Promise<readonly EngineTransactionOutput[]> {
+    try {
+      const tx = await this.client.getTransaction({ txid: txId(txid) });
+      if (tx === null) return [];
+      // The WalletClient only sees this wallet DB, so any sender id here
+      // belongs to one of OUR accounts: the wallet paid itself.
+      return tx.outputs.map((o) => ({
+        address: o.address,
+        value: o.value,
+        isChange: o.isChange,
+        sentFromThisWallet: o.sendingAccountIds.length > 0,
+      }));
     } catch (e) {
       throw mapError(e);
     }

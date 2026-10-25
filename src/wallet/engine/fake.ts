@@ -18,6 +18,7 @@ import type {
   EngineSeedAccount,
   EngineSendResult,
   EngineSyncStatus,
+  EngineTransactionOutput,
   EngineWallet,
   OpenSpec,
 } from './port';
@@ -44,6 +45,9 @@ export interface FakeAccountSpec {
   phrase?: string;
   balance?: Partial<Omit<EngineBalance, 'accountId' | 'scanned'>>;
   history?: EngineHistoryEntry[];
+  /** txid → outputs, for ADR-0004 receipt classification. `addTransaction`
+   * scripts one mid-session (a sync tick then sees it in `history`). */
+  transactions?: Record<string, EngineTransactionOutput[]>;
 }
 
 export interface FakeWalletSpec {
@@ -328,7 +332,10 @@ export class FakeWallet implements EngineWallet {
   async currentAddress(accountId: string): Promise<string | null> {
     this.check('currentAddress');
     const a = this.need(accountId);
-    return a.addresses?.[0] ?? null;
+    // SDK-model: addresses.next() ADVANCES current, so current() reads the
+    // most recently minted address (last), not the first.
+    const list = a.addresses ?? [];
+    return list.length === 0 ? null : (list[list.length - 1] as string);
   }
 
   async mintAddress(accountId: string): Promise<string> {
@@ -336,6 +343,41 @@ export class FakeWallet implements EngineWallet {
     const a = this.need(accountId);
     a.addresses = [...(a.addresses ?? []), `u1minted${(a.addresses?.length ?? 0) + 1}-${accountId}`];
     return a.addresses[a.addresses.length - 1] as string;
+  }
+
+  async listAddresses(accountId: string): Promise<readonly string[]> {
+    this.check('listAddresses');
+    return [...(this.need(accountId).addresses ?? [])];
+  }
+
+  /** txids whose wallet transaction is not readable yet: outputs answer as
+   * a single null placeholder (models the SDK's getTransaction lag behind a
+   * fresh block) until `resolveTransactions` enhances them. */
+  readonly pendingTxs = new Set<string>();
+
+  async listTransactionOutputs(txid: string): Promise<readonly EngineTransactionOutput[]> {
+    this.check('listTransactionOutputs');
+    if (this.pendingTxs.has(txid)) {
+      return [{ address: null, value: null, isChange: null, sentFromThisWallet: false }];
+    }
+    for (const a of this.specs.values()) {
+      const outs = a.transactions?.[txid];
+      if (outs !== undefined) return [...outs];
+    }
+    return [];
+  }
+
+  /** Enhancement finished: what `addTransaction` recorded becomes readable. */
+  resolveTransactions(txid: string): void {
+    this.pendingTxs.delete(txid);
+  }
+
+  /** Script a transaction landing on this account: the next getHistory and
+   * listTransactionOutputs calls see it (models a sync-discovered transfer). */
+  addTransaction(accountId: string, entry: EngineHistoryEntry, outputs: EngineTransactionOutput[]): void {
+    const a = this.need(accountId);
+    a.history = [entry, ...(a.history ?? [])];
+    a.transactions = { ...(a.transactions ?? {}), [entry.txid]: outputs };
   }
 
   async getBalance(accountId: string): Promise<EngineBalance> {

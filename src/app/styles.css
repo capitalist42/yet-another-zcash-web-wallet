@@ -145,6 +145,26 @@ input[type='radio'] {
   border-radius: 8px;
   padding: 10px;
 }
+.masked {
+  /* Reveal-under-click is view-only theater: the text node still holds the
+     full address (screen readers, harness); blur hides it from onlookers. */
+  filter: blur(5px);
+  user-select: none;
+  cursor: pointer;
+}
+.qr {
+  display: block;
+  border-radius: 8px;
+  margin-top: 8px;
+}
+.exposed {
+  list-style: none;
+  padding: 0;
+}
+.exposed li {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 0;
+}
 .phrase {
   /* grid (not columns) so words read left to right, row by row */
   display: grid;

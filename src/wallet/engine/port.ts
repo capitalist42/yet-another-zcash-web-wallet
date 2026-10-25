@@ -76,6 +76,19 @@ export interface EngineHistoryEntry {
   readonly blockTime: number | null;
   readonly balanceDelta: bigint;
   readonly pools: readonly string[];
+  /** Internal transparent→shielded move of this Wallet's own funds. Never
+   * an inbound payment (ADR-0004 rotation must ignore it). */
+  readonly isShielding: boolean | null;
+}
+
+/** One transaction output as needed to classify receipts (ADR-0004). */
+export interface EngineTransactionOutput {
+  readonly address: string | null;
+  readonly value: bigint | null;
+  /** The Wallet's own change back to itself. */
+  readonly isChange: boolean | null;
+  /** An account of THIS Wallet sent the tx: self-payment, not inbound. */
+  readonly sentFromThisWallet: boolean;
 }
 
 export interface EngineSyncStatus {
@@ -191,6 +204,12 @@ export interface EngineWallet {
   accounts(): Promise<EngineAccount[]>;
   currentAddress(accountId: string): Promise<string | null>;
   mintAddress(accountId: string): Promise<string>;
+  /** Every address this account has exposed, oldest first (ADR-0004's
+   * Exposed Address list). Reads `addresses.list`; never burns an index. */
+  listAddresses(accountId: string): Promise<readonly string[]>;
+  /** Outputs of one transaction as this Wallet sees them, for receipt
+   * classification. Empty when the Wallet never observed the tx. */
+  listTransactionOutputs(txid: string): Promise<readonly EngineTransactionOutput[]>;
   getBalance(accountId: string): Promise<EngineBalance>;
   getHistory(accountId: string, limit?: number): Promise<readonly EngineHistoryEntry[]>;
   watchSync(): AsyncIterable<EngineSyncStatus>;

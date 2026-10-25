@@ -1,10 +1,12 @@
 // Product screens: boot states, welcome, onboarding (create + forced backup
 // gate / restore / view-only import), the wallet screen, and send (#3/#4/#5).
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useStore } from '@nanostores/react';
+import { toCanvas } from 'qrcode';
 import { getApp, startApp } from './wiring';
 import type { ImportResult, RememberChoice, RestoreBirthday, SendNotice } from '../wallet/app';
 import type { EngineHistoryEntry, EngineProposal, NetworkId } from '../wallet/engine/port';
+import type { WalletKind } from '../wallet/registry';
 import { formatZats } from '../wallet/units';
 import { overallProgress } from '../wallet/sync-progress';
 
@@ -397,10 +399,95 @@ function UnlockPanel() {
   );
 }
 
+/**
+ * Receive (ADR-0004, issue #7): the Receive Address with QR + copy +
+ * reveal-under-click, plus the mandatory Exposed Address list (every minted
+ * address stays valid forever, each with its received amount). The text node
+ * keeps the FULL address even while masked — blur is CSS, so assistive tech
+ * and the verification harness read it; click (or Reveal) uncovers the pixels.
+ */
+function ReceivePanel({ kind }: { kind: WalletKind }) {
+  const address = useStore(app.address);
+  const exposed = useStore(app.exposedAddresses);
+  const [revealed, setRevealed] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    // The QR mirrors the displayed address; a rotation repaints it. Fixed
+    // light/dark modules keep scanner contrast independent of the theme.
+    const canvas = canvasRef.current;
+    if (canvas === null || address === null) return;
+    void toCanvas(canvas, address, {
+      margin: 1,
+      width: 160,
+      color: { dark: '#0f1115ff', light: '#ffffffff' },
+    }).catch(() => undefined);
+  }, [address]);
+  const copy = (): void => {
+    if (address === null) return;
+    void navigator.clipboard
+      .writeText(address)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      })
+      .catch(() => undefined); // a denied clipboard stays a denied promise
+  };
+  return (
+    <div className="receive">
+      <h2>Receive Address</h2>
+      <p
+        className={revealed ? 'address' : 'address masked'}
+        data-testid="receive-address"
+        onClick={() => setRevealed((r) => !r)}
+      >
+        {address ?? (kind === 'viewonly'
+          ? 'No Receive Address — view-only Wallets cannot mint one.'
+          : 'preparing…')}
+      </p>
+      <div className="choices">
+        <button
+          type="button"
+          className="secondary"
+          data-testid="reveal-button"
+          onClick={() => setRevealed((r) => !r)}
+        >
+          {revealed ? 'Hide' : 'Reveal'}
+        </button>
+        <button
+          type="button"
+          className="secondary"
+          data-testid="copy-address"
+          onClick={copy}
+          disabled={address === null}
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      {address !== null && (
+        <canvas ref={canvasRef} className="qr" width={160} height={160} aria-label="Receive Address QR" />
+      )}
+      {exposed.length > 0 && (
+        <div className="exposed-section">
+          <h3>Exposed Addresses</h3>
+          <ul className="exposed">
+            {exposed.map((e) => (
+              <li key={e.address} data-testid="exposed-address">
+                <span className="address">{e.address}</span>{' '}
+                <strong>{formatZats(e.receivedZats)}</strong> ZEC
+                {e.address === address && <span className="chip">shown</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function WalletScreen() {
   const info = useStore(app.walletInfo);
   const balances = useStore(app.balances);
-  const address = useStore(app.address);
   const pending = useStore(app.pendingCount);
   const canSpend = useStore(app.canSpend);
   const unlocked = useStore(app.unlocked);
@@ -451,14 +538,7 @@ function WalletScreen() {
           Ironwood <strong>{formatZats(balances?.ironwood ?? 0n)}</strong>
         </li>
       </ul>
-      <div className="receive">
-        <h2>Receive Address</h2>
-        <p className="address" data-testid="receive-address">
-          {address ?? (info.kind === 'viewonly'
-            ? 'No current address — view-only Wallets cannot mint one.'
-            : 'preparing…')}
-        </p>
-      </div>
+      <ReceivePanel kind={info.kind} />
       <div className="actions">
         {gatePending ? (
           <p className="muted">New wallet. The balance stays at zero until a payment arrives.</p>

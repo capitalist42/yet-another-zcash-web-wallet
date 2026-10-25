@@ -42,4 +42,6 @@ Keep implementation details out of the map: only user paths, stable handles, req
 - [Switch network](./switch-network.md) — header toggle: old client closes, other network's registry row boots (or welcome).
 - [Send](./send.md) — recipient, ZIP-321 prefill, memo warning, transparent refusal. Form legs are `run.mjs --feature send`. Broadcast stays operator-run (needs funds).
 
+- [Receive (auto-rotating address)](./receive.md) — masked full-text address, Reveal/Copy, QR, Exposed Address list; rotation covered by `src/wallet/receive.test.ts`.
+
 Not yet mapped (ship-gated, add when the surface exists): Pending Payments Resume/Abandon, Exclude notes, Lock/Unlock, Shielding. `docs/manual-verification.md` is the human checklist this map automates; tick items only with an evidence dir to point at.

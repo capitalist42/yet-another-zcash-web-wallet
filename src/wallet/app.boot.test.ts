@@ -10,6 +10,7 @@ import { createWalletApp, type WalletApp } from './app';
 import { DEFAULT_ENDPOINTS } from './policy';
 import { overallProgress } from './sync-progress';
 import { createVault, idbVaultStore } from './vault';
+import { syncAt, until } from './test-helpers';
 
 // A valid test vector phrase (all-zero entropy) for the restore race case.
 const FUNDED_PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -23,13 +24,6 @@ const row = (over: Partial<WalletRecord> & Pick<WalletRecord, 'id'>): WalletReco
   ...over,
 });
 
-const syncAt = (scanned: number | null, target: number | null, reached = false) => ({
-  activity: 'running' as const,
-  scanned,
-  target,
-  targetReached: reached,
-  scanComplete: reached ? true : null,
-});
 
 let engine: FakeEngine;
 let registry: Registry;
@@ -154,17 +148,6 @@ describe('boot choreography', () => {
     await app.boot();
     expect(app.screen.get()).toBe('storage-busy');
   });
-
-  /** Resolve when a store next satisfies `pred` (deterministic, no timers). */
-  const until = <T,>(store: { subscribe(fn: (v: T) => void): () => void }, pred: (v: T) => boolean): Promise<void> => {
-    const { promise, resolve } = Promise.withResolvers<void>();
-    const unsub = store.subscribe((v) => {
-      if (!pred(v)) return;
-      unsub();
-      resolve();
-    });
-    return promise;
-  };
 
   it('startup order: recovery awaited → balances from DB → THEN sync', async () => {
     await registry.add(row({ id: 'a' }));

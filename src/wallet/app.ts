@@ -92,6 +92,14 @@ export type SendNotice =
     }
   | { readonly kind: 'engine'; readonly code: EngineErrorCode; readonly recovery: EngineRecovery };
 
+/** One row of the mandatory Exposed Address list (ADR-0004): every minted
+ * address stays valid forever; the amount is what THIS session has observed
+ * landing on it (fresh payments accumulate per sync tick). */
+export interface ExposedAddress {
+  readonly address: string;
+  readonly receivedZats: bigint;
+}
+
 export type SendView =
   | { readonly phase: 'closed' }
   | { readonly phase: 'form'; readonly draft: SendDraftView; readonly notice: SendNotice }
@@ -117,6 +125,9 @@ export interface WalletApp {
   /** `sync` + the scanned account's birthday height (percent denominator). */
   readonly syncProgress: ReadableAtom<SyncProgressView | null>;
   readonly address: ReadableAtom<string | null>;
+  /** Mandatory Exposed Address list (ADR-0004): every address this account
+   * has exposed, each with the received amount observed for it. */
+  readonly exposedAddresses: ReadableAtom<readonly ExposedAddress[]>;
   readonly pendingCount: ReadableAtom<number>;
   /** Startup recovery finished (boot gate): payment paths unlock after. */
   readonly recovered: ReadableAtom<boolean>;
@@ -405,6 +416,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const creating = atom<boolean>(false);
   const bootError = atom<string | null>(null);
   const send = atom<SendView>({ phase: 'closed' });
+  /** Mandatory Exposed Address list (ADR-0004); rebuilt by observeHistory. */
+  const exposedAddresses = atom<readonly ExposedAddress[]>([]);
 
   // --- Session/Lock atoms (issue #6) --------------------------------------
   const unlocked = atom<boolean>(false);
@@ -427,6 +440,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   let pendingChoice: RememberChoice | null = null;
   /** Client whose sync stream is already subscribed. */
   let syncArmed: EngineWallet | null = null;
+  /** ADR-0004 rotation state, one lifetime per open (finishOpen re-seeds it;
+   * the open is the only way it is ever entered): txids already classified —
+   * so one landing transfer advances the display
+   * exactly once — and per-address received amounts seen this session. */
+  let observedTxids = new Set<string>();
+  let receivedByAddress = new Map<string, bigint>();
   /** Id of a create that is on screen but not registered yet. */
   let pendingWalletId: string | null = null;
 
@@ -436,6 +455,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     sync.set(null);
     birthday.set(null);
     address.set(null);
+    exposedAddresses.set([]);
     pendingCount.set(0);
     recovered.set(false);
     canSpend.set(false);
@@ -471,6 +491,77 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     pendingCount.set(ops.filter((o) => isNonTerminal(o.phase)).length);
   };
 
+  /**
+   * ADR-0004: one classification pass over history the Wallet has not
+   * observed YET this open. For every unseen entry: a Shielding is never an
+   * inbound (own transparent→shielded move). A non-self output (not change,
+   * not sent by one of our accounts — the SDK only reports sender ids from
+   * THIS wallet DB) landing on one of our Exposed Addresses credits that
+   * address's received amount; landing on the DISPLAYED address additionally
+   * rotates: mint exactly once and advance. Dedup via `observedTxids` is what
+   * makes "advances exactly once" true across ticks AND reloads (after a
+   * rotation, current() is the fresh address, so the old inbound no longer
+   * matches it). A boot pass classifies pre-existing history (deeper limit:
+   * payments seen while closed need not be in the newest 20): it credits
+   * amounts and rotates only if a rotation was still pending when the page
+   * closed — never on a wallet whose last session already advanced.
+   * An entry whose wallet transaction is not readable yet (a fresh block
+   * outruns the local tx database) stays UNobserved so a later tick retries
+   * it — but only when skipping cannot strand an owed rotation: if the
+   * unreadable transaction might pay the displayed address, commit the
+   * rotation NOW (mint once, never re-credit on the retry) rather than lose
+   * the advance forever. Read failures are swallowed like watchLoop's: a bad
+   * tick shows stale state, but each seen txid stays marked (one mint per
+   * observed transfer, never a casual burn on retry).
+   */
+  const observeHistory = async (w: EngineWallet, account: EngineAccount, limit = 20): Promise<void> => {
+    try {
+      const exposed = [...(await w.listAddresses(account.id))];
+      const history = await w.getHistory(account.id, limit);
+      let displayed = address.get();
+      for (const entry of history) {
+        if (observedTxids.has(entry.txid)) continue;
+        if (entry.isShielding === true) {
+          observedTxids.add(entry.txid);
+          continue;
+        }
+        const outputs = await w.listTransactionOutputs(entry.txid);
+        const complete = outputs.every((o) => o.address !== null && o.value !== null);
+        let inboundHere = false;
+        const credits: { address: string; value: bigint }[] = [];
+        for (const o of outputs) {
+          if (o.address === null || o.value === null) continue;
+          // Only our exposed addresses can receive; the payer's own change
+          // never counts — neither as "received" nor as a reason to rotate.
+          if (!exposed.includes(o.address)) continue;
+          if (o.isChange === true || o.sentFromThisWallet) continue;
+          credits.push({ address: o.address, value: o.value });
+          if (displayed !== null && o.address === displayed) inboundHere = true;
+        }
+        if (!complete && !inboundHere) continue; // enhancement pending; retry
+        observedTxids.add(entry.txid);
+        for (const c of credits) {
+          receivedByAddress.set(c.address, (receivedByAddress.get(c.address) ?? 0n) + c.value);
+        }
+        if (inboundHere && !account.viewOnly) {
+          const next = await w.mintAddress(account.id);
+          exposed.push(next);
+          displayed = next;
+          // Advance NOW, not after the loop: the mint is already durable, so
+          // a later entry failing must never strand the display behind the
+          // chain index it just burned. A superseded open owns stores now.
+          if (wallet === w) address.set(displayed);
+        }
+      }
+      if (wallet !== w) return; // superseded mid-await; the new open owns stores
+      exposedAddresses.set(exposed.map((a) => ({ address: a, receivedZats: receivedByAddress.get(a) ?? 0n })));
+    } catch {
+      // stale or failed classification read: display stays as-is; txids
+      // already marked stay marked, so the next tick retries only what is
+      // still unobserved — and a retried mint can never double-advance.
+    }
+  };
+
   /** Watch the sync stream; refresh displayed state per progress tick. */
   const watchLoop = async (w: EngineWallet): Promise<void> => {
     try {
@@ -488,6 +579,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           const showingZero = prev?.transparent === 0n && prev.sapling === 0n && prev.ironwood === 0n;
           // Keep the new-wallet zero until a scan reports a real figure.
           balances.set(unscanned && showingZero ? prev : raw);
+          // ADR-0004: each scan-revision tick classifies newly discovered
+          // transfers; one landing on the displayed address advances it
+          // exactly once (observedTxids dedupe).
+          await observeHistory(w, account);
         }
       }
     } catch {
@@ -566,6 +661,11 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
    */
   const finishOpen = async (w: EngineWallet, record: WalletRecord, showZeroUntilScan = false): Promise<void> => {
     wallet = w;
+    // ADR-0004 rotation state belongs to exactly one open. The create path
+    // arrives here without resetStores, so the clear lives here too.
+    observedTxids = new Set();
+    receivedByAddress = new Map();
+    exposedAddresses.set([]);
     recovered.set(true);
     walletInfo.set({
       id: record.id,
@@ -590,6 +690,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       // A view-only account cannot mint (the SDK has no spend key to derive
       // the next shielded address from); the current one is the truth.
       address.set(current ?? (account.viewOnly ? null : await w.mintAddress(account.id)));
+      // Classify local history BEFORE the first sync tick: a payment that
+      // landed while the page was closed rotates now, exactly once — after
+      // the mint, current() IS the fresh address, so a reload never burns a
+      // second index for the same transfer. Deeper than a tick's 20: a
+      // payment received while closed need not be inside the newest 20.
+      await observeHistory(w, account, 100);
       await refreshOperations();
     }
     // Subscribe BEFORE triggering sync: the SDK stream only publishes on
@@ -1605,6 +1711,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     sync,
     syncProgress,
     address,
+    exposedAddresses,
     pendingCount,
     recovered,
     canSpend,
