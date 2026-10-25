@@ -1,8 +1,8 @@
-import { defineConfig, type Connect, type ViteDevServer, type PreviewServer } from 'vite';
+import { defineConfig, type Connect, type PluginOption, type ViteDevServer, type PreviewServer } from 'vite';
 import react from '@vitejs/plugin-react';
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 // Ticket #2 spike config. Plan §1: no inlined assets (engine ships WASM, workers,
 // proving params as real files). The S4 drill proxy and COOP/COEP headers exist
@@ -135,8 +135,60 @@ function hangProxy() {
   };
 }
 
+// In dev, Vite injects CSS as inline <style> elements; the product CSP
+// (default-src 'self', no style-src) blocks them → unstyled page. Relax the
+// meta to 'unsafe-inline' for styles only while serving. Transform is serve-
+// scoped, so `vite build` ships the strict policy from index.html untouched.
+function devCsp(): PluginOption {
+  return {
+    name: 'dev-csp-allow-inline-styles',
+    apply: 'serve',
+    transformIndexHtml: (html) =>
+      html.replace(
+        'worker-src \'self\' blob:',
+        'worker-src \'self\' blob:; style-src \'self\' \'unsafe-inline\'',
+      ),
+  };
+}
+
+// The SDK fetches its own runtime artifacts (wallet.mjs, worker.mjs, …) via
+// fetch() and verifies each file's SHA-256 against pins in the manifest. Vite's
+// dev transform middleware rewrites .mjs files (import analysis, source maps),
+// inflating them ~5× and breaking the integrity check → RUNTIME_UNAVAILABLE.
+// This serves the SDK's artifact directory raw, short-circuiting the transform.
+// `apply: 'serve'` keeps it out of `vite build`; preview serves from dist/ where
+// the files are already raw (assetsInlineLimit: 0).
+const SDK_ASSET_PREFIX = '/node_modules/@zcashlabs/zcash.js/dist/src/runtime/assets/wallet/';
+const SDK_ASSET_DIR = join('node_modules', '@zcashlabs', 'zcash.js', 'dist', 'src', 'runtime', 'assets', 'wallet');
+const RAW_CONTENT_TYPES: Record<string, string> = {
+  '.wasm': 'application/wasm',
+  '.mjs': 'text/javascript',
+  '.json': 'application/json',
+};
+function serveSdkArtifactsRaw(): PluginOption {
+  return {
+    name: 'serve-sdk-artifacts-raw',
+    apply: 'serve',
+    configureServer(server) {
+      const handler: Connect.NextHandleFunction = (req, res, next) => {
+        const url = req.url ?? '';
+        if (!url.startsWith(SDK_ASSET_PREFIX)) return next();
+        const rel = url.slice(SDK_ASSET_PREFIX.length).split('?')[0];
+        const filePath = join(process.cwd(), SDK_ASSET_DIR, rel);
+        if (!existsSync(filePath)) return next();
+        const ext = '.' + (rel.split('.').pop() ?? '');
+        res.setHeader('Content-Type', RAW_CONTENT_TYPES[ext] ?? 'application/octet-stream');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(readFileSync(filePath));
+      };
+      // Prepend so this runs before vite's transformMiddleware.
+      server.middlewares.stack.unshift({ route: '', handle: handler });
+    },
+  };
+}
+
 export default defineConfig(() => ({
-  plugins: [react(), hangProxy()],
+  plugins: [react(), hangProxy(), devCsp(), serveSdkArtifactsRaw()],
   server: {
     host: '127.0.0.1',
     port: 5173,
