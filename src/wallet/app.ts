@@ -1,7 +1,10 @@
 // The Wallet app service: boot choreography + onboarding flows + UI stores.
 // Everything engine-shaped goes through the port; this module is the single
 // orchestrator the React tree subscribes to (nanostores).
-import { atom, type ReadableAtom, type WritableAtom } from 'nanostores';
+import { atom, computed, type ReadableAtom, type WritableAtom } from 'nanostores';
+/** Sync status + the account's birthday = everything the progress bar needs. */
+export type SyncProgressView = EngineSyncStatus & { readonly birthday: number | null };
+
 import type {
   Engine,
   EngineAccount,
@@ -55,6 +58,8 @@ export interface WalletApp {
   readonly walletInfo: ReadableAtom<WalletInfo | null>;
   readonly balances: ReadableAtom<EngineBalance | null>;
   readonly sync: ReadableAtom<EngineSyncStatus | null>;
+  /** `sync` + the scanned account's birthday height (percent denominator). */
+  readonly syncProgress: ReadableAtom<SyncProgressView | null>;
   readonly address: ReadableAtom<string | null>;
   readonly pendingCount: ReadableAtom<number>;
   /** Startup recovery finished (boot gate): payment paths unlock after. */
@@ -73,6 +78,9 @@ export interface WalletApp {
   openSettings(): void;
   /** Leave Settings for the open wallet, or welcome when none is open. */
   closeSettings(): void;
+  /** Erase the current Wallet (Settings → Remove Wallet): close the client,
+   * delete its OPFS storage, drop the registry row, land on welcome. */
+  removeWallet(): Promise<ImportResult>;
   /** True while a create attempt is talking to the engine. */
   readonly creating: ReadableAtom<boolean>;
   readonly onCreate: {
@@ -117,6 +125,26 @@ const asResult = (e: unknown): ImportResult => {
  * height must be a whole block height ≥ 1 before any engine call. */
 const validBirthday = (b: RestoreBirthday): boolean =>
   b === 'fullScan' || (Number.isInteger(b.height) && b.height >= 1);
+
+/** `getSyncStatus()` cadence for the in-flight progress bar (spike §Sync:
+ * the watch stream only publishes on scan-revision commits). */
+const SYNC_POLL_MS = 1_500;
+
+const delay = (ms: number): Promise<void> => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+};
+
+/** Sync-store equality: re-setting an identical snapshot every poll tick
+ * would wake every subscriber (progress bar, history refresh) for nothing. */
+const sameSync = (a: EngineSyncStatus | null, b: EngineSyncStatus): boolean =>
+  a !== null &&
+  a.activity === b.activity &&
+  a.scanned === b.scanned &&
+  a.target === b.target &&
+  a.targetReached === b.targetReached &&
+  a.scanComplete === b.scanComplete;
 
 const NETWORK_PREF_KEY = 'yaw-network';
 
@@ -180,6 +208,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const walletInfo = atom<WalletInfo | null>(null);
   const balances = atom<EngineBalance | null>(null);
   const sync = atom<EngineSyncStatus | null>(null);
+  /** Scanned account's first-scan height: the progress bar's lower bound. */
+  const birthday = atom<number | null>(null);
+  const syncProgress = computed([sync, birthday], (s, b) => (s === null ? null : { ...s, birthday: b }));
   const address = atom<string | null>(null);
   const pendingCount = atom<number>(0);
   const recovered = atom<boolean>(false);
@@ -203,6 +234,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     walletInfo.set(null);
     balances.set(null);
     sync.set(null);
+    birthday.set(null);
     address.set(null);
     pendingCount.set(0);
     recovered.set(false);
@@ -238,6 +270,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         await refreshOperations();
         const account = await defaultAccount(w);
         if (account !== undefined) {
+          birthday.set(account.birthdayHeight);
           const raw = await w.getBalance(account.id);
           const prev = balances.get();
           const unscanned = raw.transparent === null && raw.sapling === null && raw.ironwood === null;
@@ -248,6 +281,26 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       }
     } catch {
       // closed or superseded; the next open owns the stores now
+    }
+  };
+
+  /** `getSyncStatus()` answers while the scan runs; `watchSync` publishes only
+   * on scan-revision commits (spike §Sync), so without this poll the bar would
+   * sit at "—" for minutes on a long scan. Owns only the sync store: balances
+   * and operations stay on the watch stream. Stops at the tip; a failed read
+   * is not fatal (the next tick retries). */
+  const pollLoop = async (w: EngineWallet): Promise<void> => {
+    for (;;) {
+      if (wallet !== w || sync.get()?.targetReached === true) return;
+      try {
+        const status = await w.syncStatus();
+        if (wallet !== w) return;
+        if (!sameSync(sync.get(), status)) sync.set(status);
+        if (status.targetReached) continueCreateAfterTip();
+      } catch {
+        // transient engine read; retry on the next tick
+      }
+      await delay(SYNC_POLL_MS);
     }
   };
 
@@ -267,6 +320,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     canSpend.set(record.kind === 'seed');
     const account = await defaultAccount(w);
     if (account !== undefined) {
+      birthday.set(account.birthdayHeight);
       const raw = await w.getBalance(account.id);
       // A brand-new seed has no notes. Null pool fields mean "not scanned
       // yet", so the main page shows zero instead of an empty dash.
@@ -288,6 +342,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (syncArmed !== w) {
       syncArmed = w;
       void watchLoop(w);
+      void pollLoop(w);
       await w.startSync();
     }
     await deps.registry.touch(record.id);
@@ -369,6 +424,56 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const closeSettings = (): void => {
     if (screen.get() !== 'settings') return;
     screen.set(wallet !== null ? 'wallet' : 'welcome');
+  };
+
+  /**
+   * Remove the open Wallet for good (Settings → Remove Wallet). Order is the
+   * invariant: close the client FIRST (releases the exclusive OPFS lease —
+   * removeEntry fails while a live client holds the wallet DB), then drop the
+   * registry row, then erase the per-Wallet storage (ADR-0003). Failure
+   * paths reopen what is still intact and stay on Settings so the error is
+   * shown; only full success lands on welcome.
+   */
+  const removeWallet = async (): Promise<ImportResult> => {
+    const info = walletInfo.get();
+    if (info === null)
+      return { ok: false, code: 'INVALID_ARGUMENT', message: 'No Wallet is open to remove.' };
+    const record = await deps.registry.get(info.id).catch(() => null);
+    const name = storageName(record?.network ?? network.get(), info.id);
+    try {
+      await closeWallet();
+    } catch (e) {
+      return asResult(e);
+    }
+    /** Best-effort reopen after a failed step: the client is closed, so the
+     * stores must point at a live client again or the screen is a lie. */
+    const restore = async (reRegister: boolean): Promise<void> => {
+      if (record === null) {
+        screen.set('welcome');
+        return;
+      }
+      if (reRegister && (await deps.registry.add(record).catch(() => null)) === null) {
+        screen.set('welcome');
+        return;
+      }
+      await openWallet(record).catch(() => undefined);
+      screen.set(wallet !== null ? 'settings' : 'welcome');
+    };
+    try {
+      await deps.registry.remove(info.id);
+    } catch (e) {
+      await restore(false); // row survived the failed delete
+      return asResult(e);
+    }
+    try {
+      await deps.engine.removeStorage(name);
+    } catch (e) {
+      await restore(true); // storage intact (e.g. lease held elsewhere): row back, reopen
+      return asResult(e);
+    }
+    resetStores();
+    screen.set('welcome');
+    return { ok: true };
   };
 
   /** Shared create/restore/import tail: open a FRESH-id client, materialize
@@ -461,6 +566,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (syncArmed !== w) {
       syncArmed = w;
       void watchLoop(w);
+      void pollLoop(w);
       await w.startSync();
       return;
     }
@@ -746,6 +852,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     walletInfo,
     balances,
     sync,
+    syncProgress,
     address,
     pendingCount,
     recovered,
@@ -757,6 +864,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     setNetwork,
     openSettings,
     closeSettings,
+    removeWallet,
     onCreate,
     onRestore,
     onViewOnly,

@@ -282,6 +282,10 @@ class AdapterWallet implements EngineWallet {
     };
   }
 
+  async syncStatus(): Promise<EngineSyncStatus> {
+    return mapSync(await this.client.getSyncStatus());
+  }
+
   /** Fire-and-forget scan: sync() resolves at target, which can take minutes;
    * boot must not block on it. Failures surface via the sync stream/status. */
   async startSync(): Promise<void> {
@@ -326,6 +330,23 @@ const sdkTransactionPolicy = (allowTransparentSends: boolean): TransactionPolicy
   return { ...p, spendPools: p.spendPools as [Pool, ...Pool[]] };
 };
 
+/** Delete the OPFS directory the SDK creates per Wallet (ADR-0003): the SDK
+ * stores its sqlite db under `navigator.storage.getDirectory()/<name>`, so
+ * erasure is the recursive directory removal the spike's purge already proved
+ * out (fails loudly while a client still holds the exclusive lease — callers
+ * close first). Missing directory = already erased = success. */
+const removeOpfsStorage = async (name: string): Promise<void> => {
+  const root = await navigator.storage.getDirectory();
+  try {
+    await root.removeEntry(name, { recursive: true });
+  } catch (e) {
+    // Spec: NotFoundError when the entry is absent = already erased.
+    // A held lease (InvalidStateError/NoModificationAllowedError) must stay loud.
+    if (e instanceof DOMException && e.name === 'NotFoundError') return;
+    throw mapError(e);
+  }
+};
+
 /** Real engine: one Client + one OPFS db + one endpoint per open (ADR-0003). */
 export const createAdapterEngine = (): Engine => ({
   async open(spec: OpenSpec): Promise<EngineWallet> {
@@ -347,4 +368,5 @@ export const createAdapterEngine = (): Engine => ({
       throw mapError(e);
     }
   },
+  removeStorage: removeOpfsStorage,
 });

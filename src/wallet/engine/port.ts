@@ -136,6 +136,12 @@ export interface EngineWallet {
   getBalance(accountId: string): Promise<EngineBalance>;
   getHistory(accountId: string, limit?: number): Promise<readonly EngineHistoryEntry[]>;
   watchSync(): AsyncIterable<EngineSyncStatus>;
+  /**
+   * Snapshot of the current sync progress. Unlike the watchSync stream —
+   * which publishes only on scan-revision commits (spike §Sync) — this
+   * answers while a scan runs, so the progress bar can poll it.
+   */
+  syncStatus(): Promise<EngineSyncStatus>;
   startSync(): Promise<void>;
   /**
    * Bounded tip-freshness pass for mutation preconditions (accounts.create
@@ -159,4 +165,8 @@ export interface OpenSpec {
 /** The one engine seam. `open` = create-or-resume the Client for a Wallet. */
 export interface Engine {
   open(spec: OpenSpec): Promise<EngineWallet>;
+  /** Erase the OPFS database named `storageName` (Settings → Remove Wallet).
+   * Already-gone is success. The client that held it MUST be closed first:
+   * the SDK keeps exclusive sync access handles open until close(). */
+  removeStorage(storageName: string): Promise<void>;
 }
