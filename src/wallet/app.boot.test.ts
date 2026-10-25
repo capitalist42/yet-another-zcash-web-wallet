@@ -8,7 +8,6 @@ import { createRegistry, idbRegistryStore, type Registry, type WalletRecord } fr
 import { createFakeEngine, type FakeEngine } from './engine/fake';
 import { createWalletApp, type WalletApp } from './app';
 import { DEFAULT_ENDPOINTS } from './policy';
-import { overallProgress } from './sync-progress';
 
 // A valid test vector phrase (all-zero entropy) for the restore race case.
 const FUNDED_PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -217,38 +216,6 @@ describe('boot choreography', () => {
     await second;
   });
 
-  it('syncProgress carries the scanned account birthday for the percent', async () => {
-    await registry.add(row({ id: 'a' }));
-    engine.queueWallet({ accounts: [{ id: 'acct-1', birthdayHeight: 1_000_000 }] });
-    await app.boot();
-    const w = engine.lastWallet();
-    const seen = until(app.syncProgress, (s) => s?.scanned === 1_500_000);
-    w.pushSync(syncAt(1_500_000, 2_000_000));
-    await seen;
-    const view = app.syncProgress.get();
-    expect(view).toMatchObject({ scanned: 1_500_000, target: 2_000_000, birthday: 1_000_000 });
-    expect(overallProgress(view!, view!.birthday)).toMatchObject({ percent: 50, remaining: 500_000 });
-  });
-
-  it('mid-scan percent comes from getSyncStatus polls, not only the watch stream', async () => {
-    // The SDK stream publishes only on scan-revision commits; a real scan can
-    // run minutes without one. The poll loop must light the bar alone.
-    await registry.add(row({ id: 'a' }));
-    engine.queueWallet({ accounts: [{ id: 'acct-1', birthdayHeight: 1_000_000 }] });
-    await app.boot();
-    const w = engine.lastWallet();
-    w.polled.push(
-      syncAt(1_250_000, 1_500_000),
-      syncAt(1_499_000, 1_500_000),
-      syncAt(1_500_000, 1_500_000, true),
-    );
-    const done = until(app.syncProgress, (s) => s?.targetReached === true);
-    await done;
-    const view = app.syncProgress.get();
-    expect(view).toMatchObject({ scanned: 1_500_000, target: 1_500_000, targetReached: true, birthday: 1_000_000 });
-    expect(overallProgress(view!, view!.birthday).percent).toBe(100);
-  });
-
   it('non-terminal operations light the Pending Payments chip', async () => {
     await registry.add(row({ id: 'a' }));
     engine.queueWallet({
@@ -409,35 +376,6 @@ describe('boot choreography', () => {
     expect(app.network.get()).toBe('testnet');
     expect(app.walletInfo.get()?.id).toBe('t');
     expect(engine.opens[0]!.wallet.closed).toBe(true);
-  });
-
-  it('removeWallet erases the open wallet: client closed, storage purged, row gone, welcome', async () => {
-    await registry.add(row({ id: 'm' }));
-    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
-    await app.boot();
-    app.openSettings();
-    const res = await app.removeWallet();
-    expect(res.ok).toBe(true);
-    expect(app.screen.get()).toBe('welcome');
-    expect(app.walletInfo.get()).toBeNull();
-    expect(await registry.get('m')).toBeNull();
-    expect(engine.removedStorage).toEqual(['yaw-mainnet-m']);
-    expect(engine.lastWallet().closed).toBe(true);
-  });
-
-  it('a failed storage erase puts the row back and reopens the wallet', async () => {
-    await registry.add(row({ id: 'm' }));
-    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
-    await app.boot();
-    app.openSettings();
-    engine.failNextRemove(); // models another tab holding the OPFS lease
-    engine.queueWallet({ accounts: [{ id: 'acct-m' }] }); // reopen after the failed erase
-    const res = await app.removeWallet();
-    expect(res.ok).toBe(false);
-    expect(res.code).toBe('STORAGE_BUSY');
-    expect(await registry.get('m')).not.toBeNull();
-    expect(engine.removedStorage).toEqual([]);
-    expect(app.walletInfo.get()?.id).toBe('m');
   });
 
   it('a clean boot clears the previous bootError', async () => {

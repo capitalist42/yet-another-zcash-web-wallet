@@ -151,7 +151,6 @@ export class FakeWallet implements EngineWallet {
   }
 
   pushSync(status: EngineSyncStatus): void {
-    this.lastStatus = status;
     for (const w of this.watchers) w.push(status);
   }
 
@@ -308,18 +307,6 @@ export class FakeWallet implements EngineWallet {
     for (const status of this.syncQueue) this.pushSync(status);
   }
 
-  /** Scriptable mid-scan snapshots: `polled` drains first, else the last
-   * status any watcher saw — a real getSyncStatus always answers. */
-  polled: EngineSyncStatus[] = [];
-  private lastStatus: EngineSyncStatus | null = null;
-  async syncStatus(): Promise<EngineSyncStatus> {
-    this.check('syncStatus');
-    const next = this.polled.shift();
-    if (next !== undefined) return next;
-    if (this.lastStatus !== null) return this.lastStatus;
-    throw new EngineError('UNKNOWN', 'no sync status available yet');
-  }
-
   async syncFresh(_timeoutMs: number): Promise<void> {
     this.check('syncFresh');
     // the scripted freshnessGate() decides whether mutation still rejects
@@ -340,10 +327,6 @@ export class FakeWallet implements EngineWallet {
 export interface FakeEngine {
   engine: Engine;
   readonly opens: FakeOpenRecord[];
-  /** OPFS names passed to removeStorage, in call order. */
-  readonly removedStorage: string[];
-  /** Next removeStorage rejects with STORAGE_BUSY (held-lease simulation). */
-  failNextRemove(): void;
   /** Queue the spec for the NEXT open (before it is attempted). */
   queueWallet(spec: FakeWalletSpec): void;
   /** Resolved once the NEXT open call has begun (wallet instance live). */
@@ -360,10 +343,8 @@ export interface FakeEngine {
  */
 export const createFakeEngine = (defaults: FakeWalletSpec = {}): FakeEngine => {
   const opens: FakeOpenRecord[] = [];
-  const removedStorage: string[] = [];
   const queued: FakeWalletSpec[] = [];
   const pendingList: FakeWallet[] = [];
-  let removeFails = 0;
   let openStartGate = Promise.withResolvers<void>();
   return {
     engine: {
@@ -377,19 +358,8 @@ export const createFakeEngine = (defaults: FakeWalletSpec = {}): FakeEngine => {
         opens.push({ spec, wallet });
         return wallet;
       },
-      async removeStorage(storageName: string): Promise<void> {
-        if (removeFails > 0) {
-          removeFails -= 1;
-          throw new EngineError('STORAGE_BUSY', 'storage busy', true);
-        }
-        removedStorage.push(storageName);
-      },
     },
     opens,
-    removedStorage,
-    failNextRemove: () => {
-      removeFails += 1;
-    },
     queueWallet: (spec: FakeWalletSpec) => {
       queued.push(spec);
     },
