@@ -340,6 +340,10 @@ export class FakeWallet implements EngineWallet {
 export interface FakeEngine {
   engine: Engine;
   readonly opens: FakeOpenRecord[];
+  /** OPFS names passed to removeStorage, in call order. */
+  readonly removedStorage: string[];
+  /** Next removeStorage rejects with STORAGE_BUSY (held-lease simulation). */
+  failNextRemove(): void;
   /** Queue the spec for the NEXT open (before it is attempted). */
   queueWallet(spec: FakeWalletSpec): void;
   /** Resolved once the NEXT open call has begun (wallet instance live). */
@@ -356,8 +360,10 @@ export interface FakeEngine {
  */
 export const createFakeEngine = (defaults: FakeWalletSpec = {}): FakeEngine => {
   const opens: FakeOpenRecord[] = [];
+  const removedStorage: string[] = [];
   const queued: FakeWalletSpec[] = [];
   const pendingList: FakeWallet[] = [];
+  let removeFails = 0;
   let openStartGate = Promise.withResolvers<void>();
   return {
     engine: {
@@ -371,8 +377,19 @@ export const createFakeEngine = (defaults: FakeWalletSpec = {}): FakeEngine => {
         opens.push({ spec, wallet });
         return wallet;
       },
+      async removeStorage(storageName: string): Promise<void> {
+        if (removeFails > 0) {
+          removeFails -= 1;
+          throw new EngineError('STORAGE_BUSY', 'storage busy', true);
+        }
+        removedStorage.push(storageName);
+      },
     },
     opens,
+    removedStorage,
+    failNextRemove: () => {
+      removeFails += 1;
+    },
     queueWallet: (spec: FakeWalletSpec) => {
       queued.push(spec);
     },

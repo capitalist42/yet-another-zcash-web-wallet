@@ -165,4 +165,8 @@ export interface OpenSpec {
 /** The one engine seam. `open` = create-or-resume the Client for a Wallet. */
 export interface Engine {
   open(spec: OpenSpec): Promise<EngineWallet>;
+  /** Erase the OPFS database named `storageName` (Settings → Remove Wallet).
+   * Already-gone is success. The client that held it MUST be closed first:
+   * the SDK keeps exclusive sync access handles open until close(). */
+  removeStorage(storageName: string): Promise<void>;
 }

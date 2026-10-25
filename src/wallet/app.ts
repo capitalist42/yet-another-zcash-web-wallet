@@ -78,6 +78,9 @@ export interface WalletApp {
   openSettings(): void;
   /** Leave Settings for the open wallet, or welcome when none is open. */
   closeSettings(): void;
+  /** Erase the current Wallet (Settings → Remove Wallet): close the client,
+   * delete its OPFS storage, drop the registry row, land on welcome. */
+  removeWallet(): Promise<ImportResult>;
   /** True while a create attempt is talking to the engine. */
   readonly creating: ReadableAtom<boolean>;
   readonly onCreate: {
@@ -421,6 +424,56 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const closeSettings = (): void => {
     if (screen.get() !== 'settings') return;
     screen.set(wallet !== null ? 'wallet' : 'welcome');
+  };
+
+  /**
+   * Remove the open Wallet for good (Settings → Remove Wallet). Order is the
+   * invariant: close the client FIRST (releases the exclusive OPFS lease —
+   * removeEntry fails while a live client holds the wallet DB), then drop the
+   * registry row, then erase the per-Wallet storage (ADR-0003). Failure
+   * paths reopen what is still intact and stay on Settings so the error is
+   * shown; only full success lands on welcome.
+   */
+  const removeWallet = async (): Promise<ImportResult> => {
+    const info = walletInfo.get();
+    if (info === null)
+      return { ok: false, code: 'INVALID_ARGUMENT', message: 'No Wallet is open to remove.' };
+    const record = await deps.registry.get(info.id).catch(() => null);
+    const name = storageName(record?.network ?? network.get(), info.id);
+    try {
+      await closeWallet();
+    } catch (e) {
+      return asResult(e);
+    }
+    /** Best-effort reopen after a failed step: the client is closed, so the
+     * stores must point at a live client again or the screen is a lie. */
+    const restore = async (reRegister: boolean): Promise<void> => {
+      if (record === null) {
+        screen.set('welcome');
+        return;
+      }
+      if (reRegister && (await deps.registry.add(record).catch(() => null)) === null) {
+        screen.set('welcome');
+        return;
+      }
+      await openWallet(record).catch(() => undefined);
+      screen.set(wallet !== null ? 'settings' : 'welcome');
+    };
+    try {
+      await deps.registry.remove(info.id);
+    } catch (e) {
+      await restore(false); // row survived the failed delete
+      return asResult(e);
+    }
+    try {
+      await deps.engine.removeStorage(name);
+    } catch (e) {
+      await restore(true); // storage intact (e.g. lease held elsewhere): row back, reopen
+      return asResult(e);
+    }
+    resetStores();
+    screen.set('welcome');
+    return { ok: true };
   };
 
   /** Shared create/restore/import tail: open a FRESH-id client, materialize
@@ -811,6 +864,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     setNetwork,
     openSettings,
     closeSettings,
+    removeWallet,
     onCreate,
     onRestore,
     onViewOnly,

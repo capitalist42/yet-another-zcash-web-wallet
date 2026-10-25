@@ -71,6 +71,11 @@ button.secondary {
   color: var(--fg);
   border: 1px solid var(--border);
 }
+button.danger {
+  background: transparent;
+  color: var(--error);
+  border: 1px solid var(--error);
+}
 .tabs button {
   background: transparent;
   color: var(--fg);
@@ -120,7 +125,10 @@ input[type='checkbox'] {
   padding: 10px;
 }
 .phrase {
-  columns: 3;
+  /* grid (not columns) so words read left to right, row by row */
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px 12px;
   /* numbering is rendered as text inside each li, not as a marker */
   list-style: none;
   padding-left: 0;

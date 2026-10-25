@@ -25,8 +25,8 @@ export const MAINNET_ENDPOINT = 'https://zcash-mainnet.chainsafe.dev';
 export const FAUCET_API = '/faucet-api';
 
 // Live-qualification run target. Testnet is NU7 since 2026-10-04 (height
-// 4,465,026; branch 77190ad9) and rc.5's codec stops at Nu6_3 (37a5165b), so
-// the only public chain rc.5 can currently open is mainnet. ?endpoint=…&network=…
+// 4,465,026; branch 77190ad9). The nu7-testnet SDK selects that branch for the
+// public testnet and mainnet chains, so both can open. ?endpoint=…&network=…
 // selects the run target without rebuilding the bundle.
 const runParams = new URLSearchParams(window.location.search);
 export const RUN_NETWORK: 'mainnet' | 'testnet' =

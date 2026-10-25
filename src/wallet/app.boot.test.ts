@@ -411,6 +411,35 @@ describe('boot choreography', () => {
     expect(engine.opens[0]!.wallet.closed).toBe(true);
   });
 
+  it('removeWallet erases the open wallet: client closed, storage purged, row gone, welcome', async () => {
+    await registry.add(row({ id: 'm' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
+    await app.boot();
+    app.openSettings();
+    const res = await app.removeWallet();
+    expect(res.ok).toBe(true);
+    expect(app.screen.get()).toBe('welcome');
+    expect(app.walletInfo.get()).toBeNull();
+    expect(await registry.get('m')).toBeNull();
+    expect(engine.removedStorage).toEqual(['yaw-mainnet-m']);
+    expect(engine.lastWallet().closed).toBe(true);
+  });
+
+  it('a failed storage erase puts the row back and reopens the wallet', async () => {
+    await registry.add(row({ id: 'm' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
+    await app.boot();
+    app.openSettings();
+    engine.failNextRemove(); // models another tab holding the OPFS lease
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] }); // reopen after the failed erase
+    const res = await app.removeWallet();
+    expect(res.ok).toBe(false);
+    expect(res.code).toBe('STORAGE_BUSY');
+    expect(await registry.get('m')).not.toBeNull();
+    expect(engine.removedStorage).toEqual([]);
+    expect(app.walletInfo.get()?.id).toBe('m');
+  });
+
   it('a clean boot clears the previous bootError', async () => {
     let fail = true;
     const flaky: Registry = {
