@@ -197,4 +197,40 @@ describe('boot choreography', () => {
     expect(engine.opens[0]!.wallet.calls).toContain('close');
     expect(app.walletInfo.get()?.id).toBe('m');
   });
+  it('registry failure during boot surfaces honestly: welcome + bootError, no crash', async () => {
+    // IndexedDB dying on lastUsed must not reject boot() into the void.
+    const broken: Registry = {
+      ...registry,
+      lastUsed: async () => {
+        throw new Error('idb down');
+      },
+    };
+    const a = createWalletApp({
+      engine: engine.engine,
+      registry: broken,
+      endpoints: DEFAULT_ENDPOINTS,
+      requestPersist: async () => true,
+    });
+    await expect(a.boot()).resolves.toBeUndefined();
+    expect(a.screen.get()).toBe('welcome');
+    expect(a.bootError.get()).toBe('idb down');
+    expect(engine.opens).toHaveLength(0);
+  });
+
+  it('setNetwork mid-create does not relabel the Wallet onto the other network', async () => {
+    engine.queueWallet({ holdOpen: true });
+    const created = await app.onCreate.generate();
+    // confirmBackup reaches engine.open synchronously: capture the gate first.
+    const openBegan = engine.openStarted();
+    const flow = app.onCreate.confirmBackup(created.phrase);
+    await openBegan; // create in flight on testnet
+    await app.setNetwork('mainnet'); // network flips under the flow
+    engine.pending().releaseOpen();
+    expect((await flow).ok).toBe(true);
+    // the record stays on the network the client was actually opened with
+    expect(await registry.list('mainnet')).toHaveLength(0);
+    const rows = await registry.list('testnet');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ network: 'testnet', kind: 'seed' });
+  });
 });

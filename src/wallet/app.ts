@@ -235,15 +235,17 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const boot = async (): Promise<void> => {
     screen.set('booting');
     endpoint.set(deps.endpoints[network.get()]);
-    const last = await deps.registry.lastUsed(network.get());
-    if (last === null) {
-      await closeWallet();
-      screen.set('welcome');
-      return;
-    }
     try {
+      const last = await deps.registry.lastUsed(network.get());
+      if (last === null) {
+        await closeWallet();
+        screen.set('welcome');
+        return;
+      }
       await openWallet(last);
     } catch (e) {
+      // Registry (IndexedDB) failures land here too: never reject boot()
+      // into the void — surface honestly and stay on a usable screen.
       if (e instanceof EngineError && e.code === 'STORAGE_BUSY') {
         screen.set('storage-busy');
         return;
@@ -270,12 +272,16 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     run: (w: EngineWallet) => Promise<string>;
   }): Promise<ImportResult> => {
     const id = crypto.randomUUID();
+    // Capture the active Network ONCE: a setNetwork landing mid-flow must not
+    // relabel this Wallet's record onto the other network — the client below
+    // stays bound to the network it was opened with.
+    const net = network.get();
     let w: EngineWallet | null = null;
     try {
       w = await deps.engine.open({
-        network: network.get(),
-        endpoint: deps.endpoints[network.get()],
-        storageName: storageName(network.get(), id),
+        network: net,
+        endpoint: deps.endpoints[net],
+        storageName: storageName(net, id),
         allowTransparentSends: false,
       });
       // accounts.create requires coherent local chain state (SDK: stale =>
@@ -296,7 +302,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       wallet = w;
       const record: WalletRecord = {
         id,
-        network: network.get(),
+        network: net,
         name: args.name,
         fingerprint,
         kind: args.kind,
