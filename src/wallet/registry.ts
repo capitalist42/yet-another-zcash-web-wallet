@@ -77,7 +77,10 @@ export const idbRegistryStore = (): RegistryStore => {
         if (!d.objectStoreNames.contains(STORE)) d.createObjectStore(STORE, { keyPath: 'id' });
       };
       req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onerror = () => {
+        dbp = null; // don't cache the rejection: the next call retries the open
+        reject(req.error);
+      };
       dbp = promise;
     }
     return dbp;
