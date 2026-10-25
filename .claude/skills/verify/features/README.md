@@ -40,6 +40,6 @@ Keep implementation details out of the map: only user paths, stable handles, req
 - [Restore from recovery phrase](./restore-phrase.md) — Restore tab: valid/invalid phrases, birthday choice, view-after-reload.
 - [Import a viewing key (view-only)](./view-only-import.md) — View-only tab: UFVK import, View-only chip, no spend authority, no minting.
 - [Switch network](./switch-network.md) — header toggle: old client closes, other network's registry row boots (or welcome).
-- [Send](./send.md) — recipient, ZIP-321 prefill, memo warning, proposal review. Broadcast stays operator-run (needs funds).
+- [Send](./send.md) — recipient, ZIP-321 prefill, memo warning, transparent refusal. Form legs are `run.mjs --feature send`. Broadcast stays operator-run (needs funds).
 
 Not yet mapped (ship-gated, add when the surface exists): Pending Payments Resume/Abandon, Exclude notes, Lock/Unlock, Shielding. `docs/manual-verification.md` is the human checklist this map automates; tick items only with an evidence dir to point at.

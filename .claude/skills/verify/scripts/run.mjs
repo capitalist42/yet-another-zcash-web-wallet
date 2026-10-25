@@ -18,6 +18,8 @@ const BASE = `http://127.0.0.1:${port}`;
 
 const FEATURES = {
   'create-wallet': { network: 'mainnet', drive: driveCreateWallet },
+  // Form legs only. Confirm spends shielded funds and stays operator-run.
+  send: { network: 'mainnet', drive: driveCreateWallet },
 };
 if (!(feature in FEATURES)) {
   console.error(`unknown feature "${feature}". implemented: ${Object.keys(FEATURES).join(', ')}.`);
@@ -117,6 +119,80 @@ const snap = async (name) => {
   writeFileSync(`${evidenceDir}/state-${name}.aria.yml`, yaml);
   log(`snapshot -> state-${name}.aria.yml`);
 };
+
+// Classification-only fixtures. Nothing here is a funded recipient, and this
+// driver never clicks confirm-send. Body length clears classifyAddress.
+const SEND_SAPLING = `zs1${'q'.repeat(40)}`;
+const SEND_TRANSPARENT = `t1${'1'.repeat(32)}`;
+const SEND_MEMO_B64 = 'VGhpcyBpcyBhIHNpbXBsZSBtZW1vLg';
+
+async function driveSendForm() {
+  const form = () => page.locator('[aria-label="send"]');
+
+  await step('send-memo', async () => {
+    await form().locator('[data-testid="send-recipient"]').fill(SEND_SAPLING);
+    await form().locator('[data-testid="send-amount"]').fill('1');
+    if ((await page.locator('[data-testid="memo-warning"]').count()) !== 0) {
+      throw new Error('memo warning showed before a memo was entered');
+    }
+    await form().locator('[data-testid="send-memo"]').fill('hello');
+    const warning = (await page.locator('[data-testid="memo-warning"]').textContent())?.trim();
+    if (warning !== 'This memo rides on-chain, encrypted to the recipient.') {
+      throw new Error(`memo warning was "${warning}"`);
+    }
+    return 'warning appears only once a memo is entered';
+  });
+  await snap('send-memo');
+
+  await step('send-uri', async () => {
+    const uri = `zcash:${SEND_SAPLING}?amount=1&memo=${SEND_MEMO_B64}`;
+    await form().locator('[data-testid="send-recipient"]').fill(uri);
+    const recipient = await form().locator('[data-testid="send-recipient"]').inputValue();
+    const amount = await form().locator('[data-testid="send-amount"]').inputValue();
+    const memo = await form().locator('[data-testid="send-memo"]').inputValue();
+    if (recipient !== SEND_SAPLING) throw new Error(`recipient was not prefilled: "${recipient}"`);
+    if (amount !== '1') throw new Error(`amount was not prefilled: "${amount}"`);
+    if (memo !== 'This is a simple memo.') throw new Error(`memo was not decoded: "${memo}"`);
+    if ((await page.locator('[data-testid="memo-warning"]').count()) !== 1) {
+      throw new Error('prefilled memo did not keep the on-chain warning');
+    }
+    return 'ZIP-321 URI prefilled address, amount, and memo';
+  });
+  await snap('send-uri');
+
+  await step('send-transparent', async () => {
+    await form().locator('[data-testid="send-recipient"]').fill(SEND_TRANSPARENT);
+    const blocked = await form().locator('.warning').allTextContents();
+    if (!blocked.some((t) => t.includes('Transparent recipients are off'))) {
+      throw new Error(`transparent warning missing: ${blocked.join(' | ')}`);
+    }
+    if ((await page.locator('[data-testid="memo-warning"]').count()) !== 0) {
+      throw new Error('memo warning stayed up for a transparent recipient');
+    }
+    await form().locator('button', { hasText: 'Review' }).click();
+    if ((await page.locator('[aria-label="proposal review"]').count()) !== 0) {
+      throw new Error('transparent recipient reached proposal review');
+    }
+    if ((await page.locator('[aria-label="send"]').count()) !== 1) {
+      throw new Error('transparent refusal left the send form');
+    }
+    const err = (await form().locator('.error').textContent())?.trim();
+    if (err !== 'Transparent recipients are off. Allow transparent sends is in Settings.') {
+      throw new Error(`transparent refusal text was "${err}"`);
+    }
+    return 'transparent recipient refused before a proposal';
+  });
+  await snap('send-transparent');
+
+  await step('send-cancel', async () => {
+    await form().locator('button', { hasText: 'Cancel' }).click();
+    if ((await page.locator('[aria-label="send"]').count()) !== 0) throw new Error('Cancel left the send form open');
+    if ((await page.locator('[aria-label="wallet"] .actions > button', { hasText: 'Send' }).count()) !== 1) {
+      throw new Error('Send button did not return');
+    }
+    return 'Cancel closed the form; confirm was never clicked';
+  });
+}
 
 // =============================================================================
 // create-wallet — features/create-wallet.md
@@ -232,31 +308,43 @@ async function driveCreateWallet() {
     await step('wallet-screen-state', async () => {
       const net = await page.getAttribute('main.app', 'data-network');
       if (net !== network) throw new Error(`data-network flipped to "${net}"`);
-      const fp = await page.locator('[aria-label="wallet"] header .chip').first().textContent();
-      fpBefore = fp.trim();
-      if (!/^[a-z2-7]{4}$/.test(fp.trim())) throw new Error(`fingerprint chip looks wrong: "${fp}"`);
+      // The wallet screen shows as soon as the phrase is accepted. The account,
+      // fingerprint, and Send button appear only after the freshness pass.
       await page.waitForFunction(
         () => {
-          const a = document.querySelector('[data-testid="receive-address"]');
-          return a !== null && a.textContent.trim().length > 20 && !a.textContent.includes('preparing');
+          const chips = [...document.querySelectorAll('[aria-label="wallet"] header .chip')];
+          const fp = chips.map((c) => c.textContent.trim()).find((t) => /^[a-z2-7]{4}$/.test(t));
+          const addr = document.querySelector('[data-testid="receive-address"]')?.textContent?.trim() ?? '';
+          const send = [...document.querySelectorAll('[aria-label="wallet"] .actions button')].some(
+            (b) => b.textContent.trim() === 'Send',
+          );
+          return fp !== undefined && addr.length > 20 && !addr.includes('preparing') && send;
         },
         undefined,
-        { timeout: 30_000 },
+        { timeout: 120_000 },
       );
+      const fp = await page.locator('[aria-label="wallet"] header .chip').evaluateAll((els) => {
+        return els.map((e) => e.textContent.trim()).find((t) => /^[a-z2-7]{4}$/.test(t)) ?? '';
+      });
+      fpBefore = fp;
       const addr = (await page.textContent('[data-testid="receive-address"]')).trim();
       const send = page.locator('[aria-label="wallet"] .actions > button', { hasText: 'Send' });
       const disabled = await send.getAttribute('disabled');
       if (disabled !== null) throw new Error(`Send should be available on a seed wallet (disabled=${disabled})`);
       await send.click();
       await page.waitForSelector('[aria-label="send"]', { timeout: 5_000 });
-      await page.locator('[aria-label="send"] button', { hasText: 'Cancel' }).click();
-      if ((await page.locator('[aria-label="send"]').count()) !== 0) throw new Error('Cancel left the send form open');
+      if (feature !== 'send') {
+        await page.locator('[aria-label="send"] button', { hasText: 'Cancel' }).click();
+        if ((await page.locator('[aria-label="send"]').count()) !== 0) throw new Error('Cancel left the send form open');
+      }
       const history = await page.locator('[aria-label="history"]').count();
       const noHistory = await page.locator('text=No transactions yet.').count();
       if (history + noHistory === 0) throw new Error('neither history list nor its empty state rendered');
       const syncLine = await page.locator('[aria-label="wallet"] p.muted').first().textContent();
       return `fingerprint=${fp.trim()} addr=${addr.slice(0, 10)}…${addr.slice(-6)} send=opens sync="${syncLine.trim()}"`;
     });
+
+    if (feature === 'send') await driveSendForm();
 
     await step('lightd-live-and-no-third-party', async () => {
       const toEndpoint = requests.filter((r) => r.includes(ENDPOINT));

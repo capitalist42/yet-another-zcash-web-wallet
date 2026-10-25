@@ -20,7 +20,7 @@ Spend path from a seed wallet: recipient, amount, memo, a review of the exact pr
 Preconditions:
 
 - Fresh profile on mainnet. Testnet create stops at `SYNC_REQUIRED` on rc.5, so there is no wallet screen to send from.
-- Open/Cancel is asserted by the `create-wallet` driver in `scripts/run.mjs`. The steps below are the hand recipe. Do not click Confirm unless the operator means to spend shielded funds.
+- Open/Cancel on a fresh seed wallet is also asserted by `create-wallet`. The memo, URI, and transparent-refusal legs run as `node .claude/skills/verify/scripts/run.mjs --port $PORT --feature send --network mainnet`. That driver never clicks Confirm.
 
 - **Open.** Click `Send` inside `[aria-label="wallet"]`. `[aria-label="send"]` appears.
 - **Memo warning.** Put a mainnet Sapling (`zs1…`) or unified (`u1…`) address in `[data-testid="send-recipient"]` and `1` in `[data-testid="send-amount"]`. Leave the memo empty: `[data-testid="memo-warning"]` is absent. Type `hello` into `[data-testid="send-memo"]`: the warning reads "This memo rides on-chain, encrypted to the recipient."
