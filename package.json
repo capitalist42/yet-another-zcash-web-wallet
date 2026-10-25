@@ -14,7 +14,7 @@
   "dependencies": {
     "@nanostores/react": "^2.0.1",
     "@scure/bip39": "^1.6.0",
-    "@zcashlabs/zcash.js": "0.1.0-rc.5",
+    "@zcashlabs/zcash.js": "https://github.com/capitalist42/zcashjs/releases/download/sdk-nu7-testnet/zcashlabs-zcash.js-0.1.0-rc.5.tgz",
     "nanostores": "^1.5.5",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
