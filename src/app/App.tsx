@@ -176,7 +176,9 @@ function CreateFlow() {
       <h2>Write down your Recovery Phrase</h2>
       <ol className="phrase">
         {phrase.split(' ').map((w, i) => (
-          <li key={i}>{w}</li>
+          <li key={i}>
+            <span className="num">{i + 1}</span> {w}
+          </li>
         ))}
       </ol>
       <p>Anyone with these words controls your funds. No one can reset them for you.</p>
