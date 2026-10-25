@@ -13,7 +13,7 @@ The unit suites (`npm test`) and `npm run typecheck` prove module logic. They do
 
 - **Product vs spike**: the product is `/` (`index.html` → `src/main.tsx` → `src/app/App.tsx`). `/spike.html` + `scripts/drill.mjs` + the `drill/HANG` toggle + `:8081` broadcaster proxy are ticket-#2 spike qualification plumbing — do not use them to claim product behavior.
 - **Live chain is the chain of record.** Default endpoints (`src/wallet/policy.ts`): mainnet `https://zcash-mainnet.chainsafe.dev`, testnet `https://zcash-testnet.chainsafe.dev`. The SDK pins `@zcashlabs/zcash.js@0.1.0-rc.5`, whose codec tops out at Nu6.3 while the public testnet went NU7 (block 4,465,026). **Consequence, by design:** testnet create/restore surfaces `SYNC_REQUIRED` after one retry. An honest `SYNC_REQUIRED` on testnet is a PASS for error-handling legs and a hard precondition failure for anything needing scan/balance. Never weaken a journey to make it pass; record the reason in the feature's Gotchas.
-- **Funds**: mainnet funds are not scripted. Send/pay legs are out of scope until the Send surface ships (button exists, disabled, "Send ships in the next milestone"). View-only/restore journeys against funded accounts need operator-supplied secrets and are listed as preconditions, not faked.
+- **Funds**: mainnet funds are not scripted. The Send form opens from a seed wallet (see `features/send.md`); reviewing and broadcasting still need spendable shielded funds and are operator-run. View-only/restore journeys against funded accounts need operator-supplied secrets and are listed as preconditions, not faked.
 - **Never touch the user's browser or wallet.** Verification runs in a throwaway Playwright context (fresh profile per run). Recovery phrases a journey generates are throwaway by construction; still never print one into a committed file.
 - **Do not kill a preview server you did not start.** Port 4173 may be owned by a human's long-running `npm run preview`. Launch on a run-specific port instead (see Launch).
 
@@ -95,7 +95,7 @@ Proof standards (non-negotiable):
 - Verify side effects alongside what's visible: for create, the SECOND tab must show `storage busy` (OPFS lease) and a reload must boot straight into the wallet (registry row + engine DB survived); for a wallet screen, the lightd traffic in `console.log` is part of the proof that it is live-synced, not decorative text.
 - Honest failures pass honest legs: the testnet `SYNC_REQUIRED` leg PASSES by observing the `.error` element carry it (and nothing silent after) — record the observed string in `console.log`.
 - Mocks only at production boundaries already isolated: the engine port (`src/wallet/engine/port.ts`) mocks exist for vitest; the browser leg must never stub the engine or the endpoint.
-- Where a leg claims "nothing happens" (view-only can't mint/send; create writes no disk file outside the profile), prove it by observation: Send renders `disabled` (or the view-only line, no button), and `page.on('request')` shows zero requests to any non-endpoint host.
+- Where a leg claims "nothing happens" (view-only can't mint/send; create writes no disk file outside the profile), prove it by observation: a view-only wallet shows "No spend authority — this Wallet is view-only." and no Send button, and `page.on('request')` shows zero requests to any non-endpoint host.
 
 ## Cleanup
 

@@ -244,16 +244,18 @@ async function driveCreateWallet() {
         { timeout: 30_000 },
       );
       const addr = (await page.textContent('[data-testid="receive-address"]')).trim();
-      const send = page.locator('button', { hasText: 'Send' });
+      const send = page.locator('[aria-label="wallet"] .actions > button', { hasText: 'Send' });
       const disabled = await send.getAttribute('disabled');
-      const title = await send.getAttribute('title');
-      if (disabled === null || !/next milestone/.test(title ?? ''))
-        throw new Error(`Send must be disabled-with-explanation (disabled=${disabled}, title=${title})`);
+      if (disabled !== null) throw new Error(`Send should be available on a seed wallet (disabled=${disabled})`);
+      await send.click();
+      await page.waitForSelector('[aria-label="send"]', { timeout: 5_000 });
+      await page.locator('[aria-label="send"] button', { hasText: 'Cancel' }).click();
+      if ((await page.locator('[aria-label="send"]').count()) !== 0) throw new Error('Cancel left the send form open');
       const history = await page.locator('[aria-label="history"]').count();
       const noHistory = await page.locator('text=No transactions yet.').count();
       if (history + noHistory === 0) throw new Error('neither history list nor its empty state rendered');
       const syncLine = await page.locator('[aria-label="wallet"] p.muted').first().textContent();
-      return `fingerprint=${fp.trim()} addr=${addr.slice(0, 10)}…${addr.slice(-6)} send=disabled sync="${syncLine.trim()}"`;
+      return `fingerprint=${fp.trim()} addr=${addr.slice(0, 10)}…${addr.slice(-6)} send=opens sync="${syncLine.trim()}"`;
     });
 
     await step('lightd-live-and-no-third-party', async () => {

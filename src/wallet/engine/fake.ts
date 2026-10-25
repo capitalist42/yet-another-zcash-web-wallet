@@ -11,13 +11,23 @@ import type {
   EngineErrorCode,
   EngineHistoryEntry,
   EngineOperation,
+  EngineProposal,
+  EngineProposeArgs,
+  EngineRecovery,
   EngineRecoveryReport,
   EngineSeedAccount,
+  EngineSendResult,
   EngineSyncStatus,
   EngineWallet,
   OpenSpec,
 } from './port';
 import { EngineError } from './port';
+
+export interface ScriptedFailure {
+  readonly code: EngineErrorCode;
+  readonly recovery: EngineRecovery;
+  readonly message?: string;
+}
 
 export interface FakeAccountSpec {
   id: string;
@@ -123,7 +133,19 @@ export class FakeWallet implements EngineWallet {
   readonly calls: string[] = [];
   readonly watchers: SyncWatcher[] = [];
   readonly operations: EngineOperation[];
+  readonly proposeArgs: EngineProposeArgs[] = [];
+  readonly sentProposalIds: string[] = [];
+  readonly abandoned: string[] = [];
+  readonly attachArgs: { accountId: string; mnemonic: Uint8Array }[] = [];
   private readonly specs = new Map<string, FakeAccountSpec>();
+  private readonly proposalQueue: { proposal: EngineProposal; txid: string | null }[] = [];
+  private readonly proposeFails: ScriptedFailure[] = [];
+  private readonly sendFails: ScriptedFailure[] = [];
+  /** proposalId → txid returned by a successful send of that exact proposal. */
+  private readonly heldTxids = new Map<string, string | null>();
+  /** When set, abandon() records the release only after releaseAbandon(). */
+  private abandonGate: Promise<void> = Promise.resolve();
+  private letAbandon: (() => void) | null = null;
   private openGate: Deferred | null = null;
   private syncQueue: EngineSyncStatus[] = [];
   private createFails: number;
@@ -158,6 +180,32 @@ export class FakeWallet implements EngineWallet {
   setOperations(list: EngineOperation[]): void {
     this.operations.length = 0;
     this.operations.push(...list);
+  }
+
+  /** Next propose() returns this plan. `txid` is what a later send of it reports. */
+  queueProposal(proposal: EngineProposal, txid: string | null = null): void {
+    this.proposalQueue.push({ proposal, txid });
+  }
+
+  failNextPropose(failure: ScriptedFailure): void {
+    this.proposeFails.push(failure);
+  }
+
+  failNextSend(failure: ScriptedFailure): void {
+    this.sendFails.push(failure);
+  }
+
+  /** Pause abandon() so a test can see that the next review waits for it. */
+  holdAbandon(): void {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this.abandonGate = promise;
+    this.letAbandon = resolve;
+  }
+
+  releaseAbandon(): void {
+    this.letAbandon?.();
+    this.letAbandon = null;
+    this.abandonGate = Promise.resolve();
   }
 
   private check(method: string): void {
@@ -328,6 +376,67 @@ export class FakeWallet implements EngineWallet {
   async listOperations(): Promise<readonly EngineOperation[]> {
     this.check('listOperations');
     return [...this.operations];
+  }
+
+  async propose(args: EngineProposeArgs): Promise<EngineProposal> {
+    this.check('propose');
+    this.proposeArgs.push(args);
+    const fail = this.proposeFails.shift();
+    if (fail !== undefined) throw new EngineError(fail.code, fail.message ?? fail.code, false, fail.recovery);
+    const next = this.proposalQueue.shift();
+    const proposal: EngineProposal = next?.proposal ?? {
+      proposalId: `prop-${nextId++}`,
+      operationId: `op-${nextId++}`,
+      totalFee: 10_000n,
+      steps: [
+        {
+          expiryHeight: 1,
+          fee: 10_000n,
+          inputs: [{ pool: 'sapling', value: args.amount + 10_000n }],
+          outputs: [
+            {
+              kind: 'payment',
+              pool: 'sapling',
+              address: args.to,
+              amount: args.amount,
+              memo: args.memo ?? null,
+            },
+          ],
+        },
+      ],
+    };
+    this.heldTxids.set(proposal.proposalId, next?.txid ?? null);
+    return proposal;
+  }
+
+  async send(proposalId: string): Promise<EngineSendResult> {
+    this.check('send');
+    this.sentProposalIds.push(proposalId);
+    const fail = this.sendFails.shift();
+    if (fail !== undefined) throw new EngineError(fail.code, fail.message ?? fail.code, false, fail.recovery);
+    if (!this.heldTxids.has(proposalId)) {
+      throw new EngineError('INVALID_ARGUMENT', 'unknown proposal', false, 'review-new-proposal');
+    }
+    const txid = this.heldTxids.get(proposalId) ?? null;
+    const operationId = `op-send-${proposalId}`;
+    this.operations.push({ operationId, phase: 'observing', txid });
+    return { operationId, phase: 'observing', txid };
+  }
+
+  async abandon(operationId: string): Promise<void> {
+    this.check('abandon');
+    if (this.letAbandon !== null) await this.abandonGate;
+    this.abandoned.push(operationId);
+    const idx = this.operations.findIndex((op) => op.operationId === operationId);
+    if (idx >= 0) this.operations.splice(idx, 1);
+  }
+
+  async attachSigner(args: { accountId: string; mnemonic: Uint8Array }): Promise<void> {
+    this.check('attachSigner');
+    this.attachArgs.push(args);
+    this.assertPhrase(args.mnemonic);
+    const spec = this.need(args.accountId);
+    spec.signerAttached = true;
   }
 
   async close(): Promise<void> {

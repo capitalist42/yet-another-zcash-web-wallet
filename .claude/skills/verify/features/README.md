@@ -25,7 +25,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 - Capture the action and the resulting state: aria snapshot after each mapped transition, `final.png` full-page, `console.log` transcript incl. lightd request lines, `meta.json` — under `.claude/skills/verify/evidence/<UTC-ISO>-<feature>/` (gitignored; survives cleanup).
 - Mutation proof = second user-facing view: reload boots into the wallet; a second tab reports `storage busy`; the fingerprint chip is identical across the reload.
-- Side effects verified alongside pixels: lightd traffic observed, zero third-party requests, OPFS lease collision, Send disabled with its milestone explanation.
+- Side effects verified alongside pixels: lightd traffic observed, zero third-party requests, OPFS lease collision, Send opens and Cancel closes on a seed wallet.
 - Record the feature ID + entry point with every artifact. Report an unreachable path with the attempted command and the unmet precondition; never report a skipped entry point as verified through a different path.
 
 ## Feature entry contract
@@ -40,5 +40,6 @@ Keep implementation details out of the map: only user paths, stable handles, req
 - [Restore from recovery phrase](./restore-phrase.md) — Restore tab: valid/invalid phrases, birthday choice, view-after-reload.
 - [Import a viewing key (view-only)](./view-only-import.md) — View-only tab: UFVK import, View-only chip, no spend authority, no minting.
 - [Switch network](./switch-network.md) — header toggle: old client closes, other network's registry row boots (or welcome).
+- [Send](./send.md) — recipient, ZIP-321 prefill, memo warning, proposal review. Broadcast stays operator-run (needs funds).
 
-Not yet mapped (ship-gated, add when the surface exists): Send/Proposal confirmation, Pending Payments Resume/Abandon, Exclude notes, Lock/Unlock, Shielding. `docs/manual-verification.md` is the human checklist this map automates; tick items only with an evidence dir to point at.
+Not yet mapped (ship-gated, add when the surface exists): Pending Payments Resume/Abandon, Exclude notes, Lock/Unlock, Shielding. `docs/manual-verification.md` is the human checklist this map automates; tick items only with an evidence dir to point at.

@@ -1,10 +1,10 @@
 // Product screens: boot states, welcome, onboarding (create + forced backup
-// gate / restore / view-only import), and the wallet screen for issue #3/#4.
+// gate / restore / view-only import), the wallet screen, and send (#3/#4/#5).
 import { useEffect, useState } from 'react';
 import { useStore } from '@nanostores/react';
 import { getApp, startApp } from './wiring';
-import type { ImportResult, RestoreBirthday } from '../wallet/app';
-import type { EngineHistoryEntry, NetworkId } from '../wallet/engine/port';
+import type { ImportResult, RestoreBirthday, SendNotice } from '../wallet/app';
+import type { EngineHistoryEntry, EngineProposal, NetworkId } from '../wallet/engine/port';
 import { formatZats } from '../wallet/units';
 import { overallProgress } from '../wallet/sync-progress';
 
@@ -139,6 +139,187 @@ function History() {
   );
 }
 
+const noticeText = (notice: SendNotice): string | null => {
+  if (notice === null) return null;
+  switch (notice.kind) {
+    case 'invalid-recipient':
+      return 'Enter a unified, Sapling, or transparent address, or a zcash: payment URI.';
+    case 'invalid-amount':
+      return 'Enter an amount in ZEC, up to 8 decimal places.';
+    case 'memo-too-long':
+      return 'A memo can be at most 512 bytes.';
+    case 'memo-on-transparent':
+      return 'Transparent addresses cannot carry a memo.';
+    case 'transparent-disabled':
+      return 'Transparent recipients are off. Allow transparent sends is in Settings.';
+    case 'transparent-input':
+      return 'This plan would spend a transparent note. Those inputs stay excluded.';
+    case 'network-mismatch':
+      return 'That address is for the other network.';
+    case 'unavailable':
+      return 'This Wallet cannot send right now.';
+    case 'view-only':
+      return 'No spend authority — this Wallet is view-only.';
+    case 'phrase':
+      return 'Enter the 24-word recovery phrase for this Wallet.';
+    case 'engine':
+      return `The wallet refused the payment (${notice.code}).`;
+  }
+};
+
+function ProposalTable(props: { proposal: EngineProposal }) {
+  return (
+    <>
+      <p>
+        Fee <strong data-testid="proposal-fee">{formatZats(props.proposal.totalFee)}</strong> ZEC
+      </p>
+      {props.proposal.steps.map((step, index) => (
+        <div key={`${step.expiryHeight}-${index}`}>
+          <p>
+            Expiry <strong data-testid="proposal-expiry">{step.expiryHeight}</strong>
+          </p>
+          <h3>Inputs</h3>
+          <ul className="history">
+            {step.inputs.map((input, i) => (
+              <li key={`${input.pool}-${i}`}>
+                {input.pool} {formatZats(input.value)}
+              </li>
+            ))}
+          </ul>
+          <h3>Outputs</h3>
+          <ul className="history">
+            {step.outputs.map((output, i) => (
+              <li key={`${output.kind}-${i}`}>
+                {output.kind} {output.pool} {formatZats(output.amount)}
+                {output.address !== null && <span className="address">{output.address}</span>}
+                {output.memo !== null && output.memo !== '' && <span> memo: {output.memo}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function SendFlow() {
+  const view = useStore(app.send);
+  const [phrase, setPhrase] = useState('');
+  if (view.phase === 'closed') return null;
+  if (view.phase === 'sent') {
+    return (
+      <section className="form" aria-label="sent">
+        <h2>Sent</h2>
+        {view.txid !== null && <p className="address">{view.txid}</p>}
+        <button type="button" onClick={() => void app.onSend.close()}>
+          Done
+        </button>
+      </section>
+    );
+  }
+  if (view.phase === 'sync') {
+    return (
+      <section className="form" aria-label="sync required">
+        <h2>Sync</h2>
+        <p>Sync this Wallet before sending.</p>
+        <button type="button" className="secondary" onClick={() => app.onSend.backToForm()}>
+          Back
+        </button>
+      </section>
+    );
+  }
+  if (view.phase === 'unlock') {
+    const text = noticeText(view.notice);
+    return (
+      <section className="form" aria-label="unlock">
+        <h2>Unlock</h2>
+        <p>Enter this Wallet&apos;s recovery phrase to send.</p>
+        <label>
+          Recovery Phrase
+          <textarea rows={3} value={phrase} onChange={(e) => setPhrase(e.target.value)} />
+        </label>
+        {text !== null && <p className="error">{text}</p>}
+        <div className="choices">
+          <button type="button" onClick={() => void app.onSend.unlock(phrase)}>
+            Unlock
+          </button>
+          <button type="button" className="secondary" onClick={() => app.onSend.backToForm()}>
+            Back
+          </button>
+        </div>
+      </section>
+    );
+  }
+  if (view.phase === 'review') {
+    const text = noticeText(view.notice);
+    return (
+      <section className="form" aria-label="proposal review">
+        <h2>Review Proposal</h2>
+        <ProposalTable proposal={view.proposal} />
+        {text !== null && <p className="error">{text}</p>}
+        <div className="choices">
+          <button type="button" data-testid="confirm-send" onClick={() => void app.onSend.confirm()}>
+            Send
+          </button>
+          <button type="button" className="secondary" onClick={() => app.onSend.edit()}>
+            Back
+          </button>
+        </div>
+      </section>
+    );
+  }
+  const text = noticeText(view.notice);
+  return (
+    <section className="form" aria-label="send">
+      <h2>Send</h2>
+      <label>
+        Recipient
+        <textarea
+          rows={2}
+          value={view.draft.recipient}
+          data-testid="send-recipient"
+          onChange={(e) => app.onSend.setRecipient(e.target.value)}
+        />
+      </label>
+      <label>
+        Amount (ZEC)
+        <input
+          value={view.draft.amount}
+          inputMode="decimal"
+          data-testid="send-amount"
+          onChange={(e) => app.onSend.setAmount(e.target.value)}
+        />
+      </label>
+      <label>
+        Memo
+        <textarea
+          rows={2}
+          value={view.draft.memo}
+          data-testid="send-memo"
+          onChange={(e) => app.onSend.setMemo(e.target.value)}
+        />
+      </label>
+      {view.draft.memoWarning && (
+        <p className="warning" data-testid="memo-warning">
+          This memo rides on-chain, encrypted to the recipient.
+        </p>
+      )}
+      {view.draft.transparentBlocked && (
+        <p className="warning">Transparent recipients are off. Allow transparent sends is in Settings.</p>
+      )}
+      {text !== null && <p className="error">{text}</p>}
+      <div className="choices">
+        <button type="button" onClick={() => void app.onSend.review()}>
+          Review
+        </button>
+        <button type="button" className="secondary" onClick={() => void app.onSend.close()}>
+          Cancel
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function WalletScreen() {
   const info = useStore(app.walletInfo);
   const balances = useStore(app.balances);
@@ -148,6 +329,7 @@ function WalletScreen() {
   const endpoint = useStore(app.endpoint);
   const gatePending = useStore(app.backupPending);
   const creating = useStore(app.creating);
+  const send = useStore(app.send);
   if (info === null) return null;
   return (
     <section className="screen" aria-label="wallet">
@@ -187,10 +369,12 @@ function WalletScreen() {
       <div className="actions">
         {gatePending ? (
           <p className="muted">New wallet. The balance stays at zero until a payment arrives.</p>
-        ) : canSpend ? (
-          <button type="button" disabled title="Send ships in the next milestone">
+        ) : canSpend && send.phase === 'closed' ? (
+          <button type="button" onClick={() => app.onSend.open()}>
             Send
           </button>
+        ) : canSpend ? (
+          <SendFlow />
         ) : (
           <p className="muted">No spend authority — this Wallet is view-only.</p>
         )}

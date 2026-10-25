@@ -25,14 +25,29 @@ export type EngineErrorCode =
   | 'RUNTIME_UNAVAILABLE'
   | 'UNKNOWN'
 
+/** How the UI should recover. Routing keys off this, not the raw message. */
+export type EngineRecovery =
+  | 'correct-input'
+  | 'configure'
+  | 'sync'
+  | 'reattach-signer'
+  | 'review-new-proposal'
+  | 'resume-operation'
+  | 'reconcile-exact-bytes'
+  | 'reopen'
+  | 'restore'
+  | 'none';
+
 export class EngineError extends Error {
   readonly code: EngineErrorCode;
   readonly retryable: boolean;
-  constructor(code: EngineErrorCode, message: string, retryable = false) {
+  readonly recovery: EngineRecovery;
+  constructor(code: EngineErrorCode, message: string, retryable = false, recovery: EngineRecovery = 'none') {
     super(message);
     this.name = 'EngineError';
     this.code = code;
     this.retryable = retryable;
+    this.recovery = recovery;
   }
 }
 
@@ -90,6 +105,49 @@ export interface EngineOperation {
 /** Non-terminal = Pending Payment (chip lights; #10 owns the detail page). */
 export const isNonTerminal = (phase: EngineOperationPhase): boolean =>
   phase !== 'complete' && phase !== 'abandoned';
+
+export type EnginePool = 'transparent' | 'sapling' | 'ironwood';
+
+export interface EngineProposalInput {
+  readonly pool: EnginePool;
+  readonly value: bigint;
+}
+
+export interface EngineProposalOutput {
+  readonly kind: 'payment' | 'change' | 'step-funding';
+  readonly pool: EnginePool;
+  readonly address: string | null;
+  readonly amount: bigint;
+  readonly memo: string | null;
+}
+
+export interface EngineProposalStep {
+  readonly expiryHeight: number;
+  readonly fee: bigint;
+  readonly inputs: readonly EngineProposalInput[];
+  readonly outputs: readonly EngineProposalOutput[];
+}
+
+/** Inspectable spend plan. `send` executes this id, never a rebuilt payment. */
+export interface EngineProposal {
+  readonly proposalId: string;
+  readonly operationId: string;
+  readonly totalFee: bigint;
+  readonly steps: readonly EngineProposalStep[];
+}
+
+export interface EngineProposeArgs {
+  readonly accountId: string;
+  readonly to: string;
+  readonly amount: bigint;
+  readonly memo?: string;
+}
+
+export interface EngineSendResult {
+  readonly operationId: string;
+  readonly phase: EngineOperationPhase;
+  readonly txid: string | null;
+}
 
 export interface EngineRecoveryReport {
   readonly local: 'complete';
@@ -150,6 +208,13 @@ export interface EngineWallet {
    */
   syncFresh(timeoutMs: number): Promise<void>;
   listOperations(): Promise<readonly EngineOperation[]>;
+  propose(args: EngineProposeArgs): Promise<EngineProposal>;
+  /** Broadcast exactly the proposal `propose` returned. */
+  send(proposalId: string): Promise<EngineSendResult>;
+  /** Retire an unsent proposal and release its input locks. */
+  abandon(operationId: string): Promise<void>;
+  /** Restore spend authority for an existing seed account and attach it. */
+  attachSigner(args: { accountId: string; mnemonic: Uint8Array }): Promise<void>;
   close(): Promise<void>;
 }
 

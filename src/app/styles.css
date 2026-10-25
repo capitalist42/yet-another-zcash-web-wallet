@@ -36,6 +36,9 @@ h2 {
 .error {
   color: var(--error);
 }
+.warning {
+  color: var(--accent);
+}
 .row {
   display: flex;
   align-items: center;

@@ -51,6 +51,13 @@ export const RECOVERY_POLICY: { mode: 'online'; timeoutMs: number } = {
   timeoutMs: 15_000,
 };
 
+/**
+ * "Allow transparent sends" Settings switch (ADR-0005). The switch itself
+ * lands in #12; until then every Client is opened with it off, and Send
+ * refuses a transparent recipient on the same flag.
+ */
+export const ALLOW_TRANSPARENT_SENDS = false;
+
 /** Per-network endpoint settings; free-text override lands in #12. */
 export interface EndpointSettings {
   readonly mainnet: string;

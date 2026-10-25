@@ -13,7 +13,9 @@ import {
   type Birthday,
   type LightClient,
   type MemorySigner,
+  type MemoInput,
   type Pool,
+  type Proposal,
   type SyncStatus,
   type TransactionPolicy,
   type WalletClient,
@@ -27,8 +29,11 @@ import type {
   EngineErrorCode,
   EngineHistoryEntry,
   EngineOperation,
+  EngineProposal,
+  EngineProposeArgs,
   EngineRecoveryReport,
   EngineSeedAccount,
+  EngineSendResult,
   EngineSyncStatus,
   EngineWallet,
   OpenSpec,
@@ -63,7 +68,7 @@ const mapError = (e: unknown): EngineError => {
   // e.g. RUNTIME_UNAVAILABLE carries the codec/protocol diagnosis; never
   // drop the SDK code on the floor when the port code collapses.
   const message = code === 'UNKNOWN' ? `${e.code}: ${e.message}` : e.message;
-  return new EngineError(code, message, e.retryable);
+  return new EngineError(code, message, e.retryable, e.recovery);
 };
 
 const mapAccount = (a: AccountRecord): EngineAccount => ({
@@ -81,6 +86,40 @@ const mapSync = (s: SyncStatus): EngineSyncStatus => ({
   target: s.target?.height ?? null,
   targetReached: s.targetReached,
   scanComplete: s.scan.scanComplete,
+});
+
+const memoToText = (memo: MemoInput | null): string | null => {
+  if (memo === null) return null;
+  if (!('bytes' in memo) || memo.bytes === undefined) {
+    return memo.text === '' ? null : memo.text;
+  }
+  const bytes = memo.bytes;
+  let end = bytes.length;
+  while (end > 0 && bytes[end - 1] === 0) end -= 1;
+  if (end === 0) return null;
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, end));
+  } catch {
+    return null;
+  }
+};
+
+const projectProposal = (proposal: Proposal): EngineProposal => ({
+  proposalId: proposal.proposalId,
+  operationId: proposal.operationId,
+  totalFee: proposal.totalFee,
+  steps: proposal.steps.map((step) => ({
+    expiryHeight: step.expiryHeight,
+    fee: step.fee,
+    inputs: step.inputs.map((input) => ({ pool: input.pool, value: input.value })),
+    outputs: step.outputs.map((output) => ({
+      kind: output.kind,
+      pool: output.pool,
+      address: output.address,
+      amount: output.amount,
+      memo: memoToText(output.memo),
+    })),
+  })),
 });
 
 const mapHistory = (h: {
@@ -101,6 +140,10 @@ class AdapterWallet implements EngineWallet {
   readonly recovery: EngineRecoveryReport;
   /** EngineBirthdayHandle -> resolved SDK Birthday witness. */
   private readonly birthdays = new Map<EngineBirthdayHandle, Birthday>();
+  /** proposalId → the SDK object send() must execute unchanged. */
+  private readonly proposals = new Map<string, Proposal>();
+  /** Attached signers stay alive for the session; disposing one detaches spend authority. */
+  private readonly signers = new Map<string, MemorySigner>();
   private readonly client: WalletClient;
   private readonly light: LightClient;
   private closing = false;
@@ -168,7 +211,8 @@ class AdapterWallet implements EngineWallet {
   }
 
   /** The created signer is caller-owned memory-only authority; ufvk() reads
-   * its descriptor, dispose() wipes it. Never attached to the client (#5). */
+   * its descriptor, dispose() wipes it. Spend authority is attached later,
+   * on Unlock, via attachSigner. */
   private seedAccount(account: AccountRecord, signer: MemorySigner): EngineSeedAccount {
     const projected = mapAccount(account);
     return {
@@ -304,6 +348,74 @@ class AdapterWallet implements EngineWallet {
     }
   }
 
+  async propose(args: EngineProposeArgs): Promise<EngineProposal> {
+    try {
+      const proposal = await this.client.propose({
+        accountId: args.accountId as AccountId,
+        to: args.to,
+        amount: args.amount,
+        ...(args.memo === undefined ? {} : { memo: { text: args.memo } }),
+      });
+      this.proposals.set(proposal.proposalId, proposal);
+      return projectProposal(proposal);
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  async send(proposalId: string): Promise<EngineSendResult> {
+    const proposal = this.proposals.get(proposalId);
+    if (proposal === undefined) {
+      throw new EngineError('INVALID_ARGUMENT', 'unknown proposal', false, 'review-new-proposal');
+    }
+    try {
+      // The stored object is the plan the user reviewed. send() executes it
+      // as-is: no second propose, no rebuilt outputs.
+      const pending = await this.client.send({ proposal });
+      this.proposals.delete(proposalId);
+      const snap = await pending.snapshot();
+      return {
+        operationId: snap.operationId,
+        phase: snap.phase,
+        txid: snap.steps[0]?.txid ?? null,
+      };
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  async abandon(operationId: string): Promise<void> {
+    try {
+      await this.client.operations.abandon({ operationId });
+      for (const [id, proposal] of this.proposals) {
+        if (proposal.operationId === operationId) this.proposals.delete(id);
+      }
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  async attachSigner(args: { accountId: string; mnemonic: Uint8Array }): Promise<void> {
+    let signer: MemorySigner | null = null;
+    try {
+      signer = await this.client.accounts.restoreSigner({
+        accountId: args.accountId as AccountId,
+        mnemonic: args.mnemonic,
+      });
+      await this.client.accounts.attachSigner({
+        accountId: args.accountId as AccountId,
+        signer,
+      });
+      const previous = this.signers.get(args.accountId);
+      this.signers.set(args.accountId, signer);
+      signer = null;
+      if (previous !== undefined) await previous.dispose();
+    } catch (e) {
+      if (signer !== null) await signer.dispose().catch(() => undefined);
+      throw mapError(e);
+    }
+  }
+
   async listOperations(): Promise<readonly EngineOperation[]> {
     try {
       const page = await this.client.operations.list();
@@ -319,6 +431,8 @@ class AdapterWallet implements EngineWallet {
 
   async close(): Promise<void> {
     this.closing = true;
+    for (const signer of this.signers.values()) await signer.dispose().catch(() => undefined);
+    this.signers.clear();
     await this.client.close();
   }
 }

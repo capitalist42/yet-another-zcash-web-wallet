@@ -9,16 +9,21 @@ import type {
   Engine,
   EngineAccount,
   EngineBalance,
+  EngineErrorCode,
   EngineHistoryEntry,
+  EngineProposal,
+  EngineRecovery,
   EngineSyncStatus,
   EngineWallet,
   NetworkId,
 } from './engine/port';
-import { EngineError, isNonTerminal, type EngineErrorCode } from './engine/port';
+import { EngineError, isNonTerminal } from './engine/port';
 import type { Registry, WalletKind, WalletRecord } from './registry';
-import { storageName, FRESHNESS_TIMEOUT_MS, type EndpointSettings } from './policy';
+import { ALLOW_TRANSPARENT_SENDS, storageName, FRESHNESS_TIMEOUT_MS, type EndpointSettings } from './policy';
 import { fingerprintFromUfvk } from './fingerprint';
 import { generatePhrase, normalizePhrase, phraseBytes, zeroize } from './keys';
+import { formatZats, parseZecAmount } from './units';
+import { classifyAddress, parseZip321 } from './zip321';
 
 export type Screen = 'booting' | 'welcome' | 'wallet' | 'settings' | 'storage-busy';
 
@@ -48,6 +53,46 @@ export interface SpendGuard {
   readonly ok: boolean;
   readonly reason?: 'view-only' | 'unavailable';
 }
+
+export interface SendDraftView {
+  readonly recipient: string;
+  readonly amount: string;
+  readonly memo: string;
+  /** Non-empty memo that will ride on-chain, encrypted to the recipient. */
+  readonly memoWarning: boolean;
+  /** Transparent recipient while Allow transparent sends is off. */
+  readonly transparentBlocked: boolean;
+}
+
+export type SendNotice =
+  | null
+  | {
+      readonly kind:
+        | 'invalid-recipient'
+        | 'invalid-amount'
+        | 'memo-too-long'
+        | 'memo-on-transparent'
+        | 'transparent-disabled'
+        | 'transparent-input'
+        | 'network-mismatch'
+        | 'unavailable'
+        | 'view-only'
+        | 'phrase';
+    }
+  | { readonly kind: 'engine'; readonly code: EngineErrorCode; readonly recovery: EngineRecovery };
+
+export type SendView =
+  | { readonly phase: 'closed' }
+  | { readonly phase: 'form'; readonly draft: SendDraftView; readonly notice: SendNotice }
+  | {
+      readonly phase: 'review';
+      readonly draft: SendDraftView;
+      readonly proposal: EngineProposal;
+      readonly notice: SendNotice;
+    }
+  | { readonly phase: 'unlock'; readonly draft: SendDraftView; readonly notice: SendNotice }
+  | { readonly phase: 'sync'; readonly draft: SendDraftView }
+  | { readonly phase: 'sent'; readonly txid: string | null };
 
 export interface WalletApp {
   // --- stores (UI subscribes; tests assert) --------------------------------
@@ -103,6 +148,23 @@ export interface WalletApp {
   };
   /** Capability gate the Send surface must pass before composing (#4). */
   guardSpend(): SpendGuard;
+  readonly send: ReadableAtom<SendView>;
+  readonly onSend: {
+    open(): void;
+    close(): Promise<void>;
+    setRecipient(text: string): void;
+    setAmount(text: string): void;
+    setMemo(text: string): void;
+    review(): Promise<void>;
+    /** Broadcast the proposal currently on the review screen. */
+    confirm(): Promise<void>;
+    /** Re-enter the seed phrase after a reattach-signer recovery. */
+    unlock(phrase: string): Promise<void>;
+    /** Leave the sync route and rebuild the payment. */
+    backToForm(): void;
+    /** Leave review without sending. The proposal is released. */
+    edit(): void;
+  };
   history(): Promise<readonly EngineHistoryEntry[]>;
 }
 
@@ -218,10 +280,13 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const backupPending = atom<boolean>(false);
   const creating = atom<boolean>(false);
   const bootError = atom<string | null>(null);
+  const send = atom<SendView>({ phase: 'closed' });
 
   const traceSecret = deps.traceSecret ?? (() => undefined);
 
   let wallet: EngineWallet | null = null;
+  /** Proposal the review screen is holding. send() uses this id and no other. */
+  let held: EngineProposal | null = null;
   let openSeq = 0;
   let createPhrase: string | null = null;
   let backupConfirmed = false;
@@ -240,13 +305,19 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     recovered.set(false);
     canSpend.set(false);
     bootError.set(null);
+    held = null;
+    send.set({ phase: 'closed' });
   };
 
   const closeWallet = async (): Promise<void> => {
     openSeq += 1; // invalidate in-flight opens and watch loops
+    const op = held?.operationId ?? null;
+    held = null;
+    send.set({ phase: 'closed' });
     const w = wallet;
     wallet = null;
     syncArmed = null;
+    if (w !== null && op !== null) await w.abandon(op).catch(() => undefined);
     if (w !== null) await w.close();
   };
 
@@ -362,7 +433,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       network: record.network,
       endpoint: deps.endpoints[record.network],
       storageName: storageName(record.network, record.id),
-      allowTransparentSends: false, // Settings switch lands in #12; default off
+      allowTransparentSends: ALLOW_TRANSPARENT_SENDS,
     });
     if (seq !== openSeq) {
       await w.close(); // superseded by a newer open (network switch)
@@ -498,7 +569,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         network: net,
         endpoint: deps.endpoints[net],
         storageName: storageName(net, id),
-        allowTransparentSends: false,
+        allowTransparentSends: ALLOW_TRANSPARENT_SENDS,
       });
       // accounts.create requires coherent local chain state (SDK: stale =>
       // SYNC_REQUIRED before mutation, "after explicit sync"). Bounded
@@ -625,7 +696,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           network: net,
           endpoint: deps.endpoints[net],
           storageName: storageName(net, pendingWalletId),
-          allowTransparentSends: false,
+          allowTransparentSends: ALLOW_TRANSPARENT_SENDS,
         });
       }
       const id = pendingWalletId ?? walletInfo.get()?.id ?? crypto.randomUUID();
@@ -845,6 +916,277 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     },
   };
 
+  interface Draft {
+    recipient: string;
+    amount: string;
+    memo: string;
+  }
+
+  const emptyDraft = (): Draft => ({ recipient: '', amount: '', memo: '' });
+
+  const draftView = (draft: Draft): SendDraftView => {
+    const recipient = draft.recipient.trim();
+    const classified = recipient === '' ? null : classifyAddress(recipient, network.get());
+    const memo = draft.memo.trim();
+    const transparent = classified?.ok === true && classified.kind === 'transparent';
+    return {
+      recipient: draft.recipient,
+      amount: draft.amount,
+      memo: draft.memo,
+      memoWarning: memo !== '' && !transparent,
+      transparentBlocked: transparent && !ALLOW_TRANSPARENT_SENDS,
+    };
+  };
+
+  const showForm = (draft: Draft, notice: SendNotice): void => {
+    send.set({ phase: 'form', draft: draftView(draft), notice });
+  };
+
+  const readDraft = (view: { readonly draft: SendDraftView }): Draft => ({
+    recipient: view.draft.recipient,
+    amount: view.draft.amount,
+    memo: view.draft.memo,
+  });
+
+  /** In-flight abandon. A new propose waits on this so input locks are free. */
+  let releaseTail: Promise<void> = Promise.resolve();
+  let releasesInFlight = 0;
+
+  const releaseHeld = (): Promise<void> => {
+    const op = held?.operationId ?? null;
+    const current = wallet;
+    held = null;
+    if (op === null || current === null) return releaseTail;
+    const run = (): Promise<void> => {
+      releasesInFlight += 1;
+      return current.abandon(op).catch(() => undefined).finally(() => {
+        releasesInFlight -= 1;
+      });
+    };
+    // Start now when idle. Chaining through an already-settled promise would
+    // defer the engine call a turn, and the next review could race it.
+    const job = releasesInFlight === 0 ? run() : releaseTail.then(run);
+    releaseTail = job;
+    return job;
+  };
+
+  const spendGuard = (): SpendGuard => {
+    const info = walletInfo.get();
+    if (info === null) return { ok: false, reason: 'unavailable' };
+    if (info.kind !== 'seed') return { ok: false, reason: 'view-only' };
+    if (!recovered.get()) return { ok: false, reason: 'unavailable' };
+    return { ok: true };
+  };
+
+  type Resolved =
+    | { readonly ok: true; readonly to: string; readonly amount: bigint; readonly memo?: string }
+    | { readonly ok: false; readonly notice: SendNotice };
+
+  const noticeForUri = (error: string): SendNotice => {
+    if (error === 'memo-on-transparent') return { kind: 'memo-on-transparent' };
+    if (error === 'network-mismatch') return { kind: 'network-mismatch' };
+    return { kind: 'invalid-recipient' };
+  };
+
+  /** Recipient text, amount text, and memo → the payment propose() will build. */
+  const resolveDraft = (draft: Draft): Resolved => {
+    let recipient = draft.recipient.trim();
+    let amountText = draft.amount.trim();
+    let memo = draft.memo.trim();
+    if (recipient.startsWith('zcash:')) {
+      const uri = parseZip321(recipient, network.get());
+      if (!uri.ok) return { ok: false, notice: noticeForUri(uri.error) };
+      recipient = uri.address;
+      if (uri.amountZats !== null) amountText = formatZats(uri.amountZats);
+      if (uri.memo !== null) memo = uri.memo;
+    }
+    const classified = classifyAddress(recipient, network.get());
+    if (!classified.ok) return { ok: false, notice: noticeForUri(classified.error) };
+    if (classified.kind === 'transparent') {
+      if (!ALLOW_TRANSPARENT_SENDS) return { ok: false, notice: { kind: 'transparent-disabled' } };
+      if (memo !== '') return { ok: false, notice: { kind: 'memo-on-transparent' } };
+    }
+    const amount = parseZecAmount(amountText);
+    if (amount === null || amount <= 0n) return { ok: false, notice: { kind: 'invalid-amount' } };
+    if (new TextEncoder().encode(memo).length > 512) return { ok: false, notice: { kind: 'memo-too-long' } };
+    return { ok: true, to: recipient, amount, ...(memo === '' ? {} : { memo }) };
+  };
+
+  const routeEngine = async (error: unknown, draft: Draft, keepProposal: boolean): Promise<void> => {
+    if (!(error instanceof EngineError)) {
+      await releaseHeld();
+      showForm(draft, { kind: 'engine', code: 'UNKNOWN', recovery: 'none' });
+      return;
+    }
+    if (error.recovery === 'sync') {
+      await releaseHeld();
+      send.set({ phase: 'sync', draft: draftView(draft) });
+      return;
+    }
+    if (error.recovery === 'reattach-signer') {
+      send.set({ phase: 'unlock', draft: draftView(draft), notice: null });
+      return;
+    }
+    if (error.recovery === 'review-new-proposal') {
+      await releaseHeld();
+      showForm(draft, null);
+      return;
+    }
+    const engineNotice: SendNotice = { kind: 'engine', code: error.code, recovery: error.recovery };
+    if (keepProposal && held !== null) {
+      send.set({ phase: 'review', draft: draftView(draft), proposal: held, notice: engineNotice });
+      return;
+    }
+    showForm(draft, engineNotice);
+  };
+
+  const editDraft = (next: Draft): void => {
+    const phase = send.get().phase;
+    if (phase !== 'form' && phase !== 'review') return;
+    if (phase === 'review') void releaseHeld();
+    showForm(next, null);
+  };
+
+  const onSend = {
+    open(): void {
+      const phase = send.get().phase;
+      if (phase !== 'closed' && phase !== 'sent') return;
+      if (!spendGuard().ok) return;
+      showForm(emptyDraft(), null);
+    },
+    async close(): Promise<void> {
+      await releaseHeld();
+      send.set({ phase: 'closed' });
+    },
+    setRecipient(text: string): void {
+      const view = send.get();
+      if (view.phase !== 'form' && view.phase !== 'review') return;
+      const draft = readDraft(view);
+      const trimmed = text.trim();
+      if (trimmed.startsWith('zcash:')) {
+        const uri = parseZip321(trimmed, network.get());
+        if (view.phase === 'review') void releaseHeld();
+        if (!uri.ok) {
+          showForm({ ...draft, recipient: text }, noticeForUri(uri.error));
+          return;
+        }
+        showForm(
+          {
+            recipient: uri.address,
+            amount: uri.amountZats !== null ? formatZats(uri.amountZats) : draft.amount,
+            memo: uri.memo !== null ? uri.memo : draft.memo,
+          },
+          null,
+        );
+        return;
+      }
+      editDraft({ ...draft, recipient: text });
+    },
+    setAmount(text: string): void {
+      const view = send.get();
+      if (view.phase !== 'form' && view.phase !== 'review') return;
+      editDraft({ ...readDraft(view), amount: text });
+    },
+    setMemo(text: string): void {
+      const view = send.get();
+      if (view.phase !== 'form' && view.phase !== 'review') return;
+      editDraft({ ...readDraft(view), memo: text });
+    },
+    async review(): Promise<void> {
+      const view = send.get();
+      if ((view.phase !== 'form' && view.phase !== 'review') || wallet === null) return;
+      const draft = readDraft(view);
+      const guard = spendGuard();
+      if (!guard.ok) {
+        showForm(draft, { kind: guard.reason === 'view-only' ? 'view-only' : 'unavailable' });
+        return;
+      }
+      const resolved = resolveDraft(draft);
+      if (!resolved.ok) {
+        if (view.phase === 'review') void releaseHeld();
+        showForm(draft, resolved.notice);
+        return;
+      }
+      await releaseHeld();
+      const account = await defaultAccount(wallet);
+      if (account === undefined) {
+        showForm(draft, { kind: 'unavailable' });
+        return;
+      }
+      try {
+        const proposal = await wallet.propose({
+          accountId: account.id,
+          to: resolved.to,
+          amount: resolved.amount,
+          ...(resolved.memo === undefined ? {} : { memo: resolved.memo }),
+        });
+        if (proposal.steps.some((step) => step.inputs.some((input) => input.pool === 'transparent'))) {
+          held = proposal;
+          await releaseHeld();
+          showForm(draft, { kind: 'transparent-input' });
+          return;
+        }
+        held = proposal;
+        send.set({ phase: 'review', draft: draftView(draft), proposal, notice: null });
+      } catch (error) {
+        await routeEngine(error, draft, false);
+      }
+    },
+    async confirm(): Promise<void> {
+      const view = send.get();
+      if (view.phase !== 'review' || held === null || wallet === null) return;
+      const draft = readDraft(view);
+      try {
+        const result = await wallet.send(held.proposalId);
+        held = null;
+        await refreshOperations();
+        send.set({ phase: 'sent', txid: result.txid });
+      } catch (error) {
+        await routeEngine(error, draft, true);
+      }
+    },
+    async unlock(phrase: string): Promise<void> {
+      const view = send.get();
+      if (view.phase !== 'unlock' || wallet === null) return;
+      const draft = readDraft(view);
+      let normalized: string;
+      try {
+        normalized = normalizePhrase(phrase);
+      } catch {
+        send.set({ phase: 'unlock', draft: view.draft, notice: { kind: 'phrase' } });
+        return;
+      }
+      const bytes = phraseBytes(normalized);
+      traceSecret(bytes);
+      try {
+        const account = await defaultAccount(wallet);
+        if (account === undefined) {
+          send.set({ phase: 'unlock', draft: view.draft, notice: { kind: 'unavailable' } });
+          return;
+        }
+        await wallet.attachSigner({ accountId: account.id, mnemonic: bytes });
+        if (held !== null) send.set({ phase: 'review', draft: draftView(draft), proposal: held, notice: null });
+        else showForm(draft, null);
+      } catch (error) {
+        await routeEngine(error, draft, held !== null);
+      } finally {
+        zeroize(bytes);
+      }
+    },
+    backToForm(): void {
+      const view = send.get();
+      if (view.phase !== 'sync' && view.phase !== 'unlock') return;
+      if (view.phase === 'unlock') void releaseHeld();
+      showForm(readDraft(view), null);
+    },
+    edit(): void {
+      const view = send.get();
+      if (view.phase !== 'review') return;
+      void releaseHeld();
+      showForm(readDraft(view), null);
+    },
+  };
+
   return {
     screen,
     network,
@@ -868,13 +1210,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     onCreate,
     onRestore,
     onViewOnly,
-    guardSpend(): SpendGuard {
-      const info = walletInfo.get();
-      if (info === null) return { ok: false, reason: 'unavailable' };
-      if (info.kind !== 'seed') return { ok: false, reason: 'view-only' };
-      if (!recovered.get()) return { ok: false, reason: 'unavailable' };
-      return { ok: true };
-    },
+    guardSpend: spendGuard,
+    send,
+    onSend,
     async history(): Promise<readonly EngineHistoryEntry[]> {
       if (wallet === null) return [];
       const account = await defaultAccount(wallet);
