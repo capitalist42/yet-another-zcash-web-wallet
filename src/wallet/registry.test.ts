@@ -77,7 +77,6 @@ describe('IDB open failure', () => {
         }
         return real.open(name, version);
       },
-      deleteDatabase: (name: string) => real.deleteDatabase(name),
     };
     Object.defineProperty(globalThis, 'indexedDB', { value: failing, writable: true, configurable: true });
     const store = idbRegistryStore();

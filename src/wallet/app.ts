@@ -277,6 +277,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     // relabel this Wallet's record onto the other network — the client below
     // stays bound to the network it was opened with.
     const net = network.get();
+    // Session token: any closeWallet() (i.e. network switch) bumps openSeq.
+    // Landing after a bump means the switch owns the screen now, not us.
+    const seq = openSeq;
     let w: EngineWallet | null = null;
     try {
       w = await deps.engine.open({
@@ -299,8 +302,6 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       }
       const fingerprint = await fingerprintFromUfvk(fingerprintSource);
       await deps.requestPersist();
-      await closeWallet();
-      wallet = w;
       const record: WalletRecord = {
         id,
         network: net,
@@ -310,6 +311,15 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         lastUsed: Date.now(),
       };
       await deps.registry.add(record);
+      if (seq !== openSeq) {
+        // A network switch landed mid-flow: that session owns the screen and
+        // the stores. This Wallet is registered and its data lives in its own
+        // per-Wallet DB (ADR-0003): close our client, leave theirs untouched.
+        await w.close();
+        return { ok: true };
+      }
+      await closeWallet();
+      wallet = w;
       await finishOpen(w, record);
       return { ok: true };
     } catch (e) {

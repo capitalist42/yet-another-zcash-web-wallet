@@ -9,6 +9,9 @@ import { createFakeEngine, type FakeEngine } from './engine/fake';
 import { createWalletApp, type WalletApp } from './app';
 import { DEFAULT_ENDPOINTS } from './policy';
 
+// A valid test vector phrase (all-zero entropy) for the restore race case.
+const FUNDED_PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
 const row = (over: Partial<WalletRecord> & Pick<WalletRecord, 'id'>): WalletRecord => ({
   network: 'testnet',
   name: 'wallet',
@@ -232,6 +235,52 @@ describe('boot choreography', () => {
     const rows = await registry.list('testnet');
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ network: 'testnet', kind: 'seed' });
+  });
+
+  it('setNetwork mid-create lets the switch keep its session', async () => {
+    // The full race: the target network HAS a Wallet, so the switch's boot
+    // opens a live client while the testnet create is still in flight.
+    // The switch owns the session then; the create may only land its record.
+    await registry.add(row({ id: 'm', network: 'mainnet' }));
+    engine.queueWallet({ holdOpen: true }); // create client (testnet)
+    const created = await app.onCreate.generate();
+    const openBegan = engine.openStarted();
+    const flow = app.onCreate.confirmBackup(created.phrase);
+    await openBegan;
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] }); // mainnet boot client
+    await app.setNetwork('mainnet'); // switch lands mid-create
+    expect(app.walletInfo.get()?.id).toBe('m');
+    engine.pending().releaseOpen(); // create client finishes
+    expect((await flow).ok).toBe(true);
+    // the record lands where it belongs: nothing relabeled, nothing lost
+    expect((await registry.list('mainnet')).map((w) => w.id)).toEqual(['m']);
+    const testnet = engine.opens.find((o) => o.spec.network === 'testnet')!.wallet;
+    expect(testnet.closed).toBe(true); // ours closes, data lives in its own DB
+    // the switch's session survived: its client open, stores still its own
+    const mainnet = engine.opens.find((o) => o.spec.network === 'mainnet')!.wallet;
+    expect(mainnet.calls).not.toContain('close');
+    expect(app.walletInfo.get()?.id).toBe('m');
+    expect(app.screen.get()).toBe('wallet');
+  });
+
+  it('a network switch during restore keeps its own session too', async () => {
+    // Same race on the shared flow tail that Restore and View-only import
+    // use: the switch's booted session must survive the flow landing.
+    await registry.add(row({ id: 'm', network: 'mainnet' }));
+    engine.queueWallet({ holdOpen: true }); // restore client (testnet)
+    const openBegan = engine.openStarted();
+    const flow = app.onRestore.restore({ phrase: FUNDED_PHRASE, accountIndex: 0, birthday: 'fullScan' });
+    await openBegan;
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] }); // mainnet boot client
+    await app.setNetwork('mainnet'); // switch lands mid-flow
+    engine.pending().releaseOpen();
+    expect((await flow).ok).toBe(true);
+    const testnet = engine.opens.find((o) => o.spec.network === 'testnet')!.wallet;
+    expect(testnet.closed).toBe(true); // ours lands the row, then closes
+    const mainnet = engine.opens.find((o) => o.spec.network === 'mainnet')!.wallet;
+    expect(mainnet.calls).not.toContain('close');
+    expect(app.walletInfo.get()?.id).toBe('m');
+    expect((await registry.list('testnet'))[0]).toMatchObject({ network: 'testnet', kind: 'seed' });
   });
 
   it('a clean boot clears the previous bootError', async () => {
