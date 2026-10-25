@@ -21,6 +21,8 @@ export type EngineErrorCode =
   | 'SIGNER_REQUIRED'
   | 'SYNC_REQUIRED'
   | 'TIMEOUT'
+  /** SDK artifact acquisition/integrity failure; recoverable by reloading fresh assets. */
+  | 'RUNTIME_UNAVAILABLE'
   | 'UNKNOWN'
 
 export class EngineError extends Error {

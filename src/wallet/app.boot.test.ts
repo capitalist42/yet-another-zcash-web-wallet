@@ -13,7 +13,7 @@ import { DEFAULT_ENDPOINTS } from './policy';
 const FUNDED_PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
 const row = (over: Partial<WalletRecord> & Pick<WalletRecord, 'id'>): WalletRecord => ({
-  network: 'testnet',
+  network: 'mainnet',
   name: 'wallet',
   fingerprint: 'abcd',
   kind: 'seed',
@@ -49,12 +49,13 @@ describe('boot choreography', () => {
   it('fresh registry → welcome, no engine calls', async () => {
     await app.boot();
     expect(app.screen.get()).toBe('welcome');
+    expect(app.network.get()).toBe('mainnet');
     expect(engine.opens).toHaveLength(0);
   });
 
   it('opens the last-used Wallet for the active network with the right spec', async () => {
-    await registry.add(row({ id: 'old', lastUsed: 100 }));
-    await registry.add(row({ id: 'new', lastUsed: 300 }));
+    await registry.add(row({ id: 'old', network: 'testnet', lastUsed: 100 }));
+    await registry.add(row({ id: 'new', network: 'testnet', lastUsed: 300 }));
     app.network.set('testnet');
     await app.boot();
     expect(engine.opens).toHaveLength(1);
@@ -63,6 +64,76 @@ describe('boot choreography', () => {
     expect(spec.network).toBe('testnet');
     expect(spec.endpoint).toContain('chainsafe');
     expect((await registry.get('new'))?.lastUsed).toBeGreaterThanOrEqual(300);
+  });
+
+  it('reload finishes a wallet that was saved before the account existed', async () => {
+    const phrase = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+    const mem = new Map<string, string>();
+    const previous = globalThis.sessionStorage;
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => mem.get(key) ?? null,
+        setItem: (key: string, value: string) => { mem.set(key, value); },
+        removeItem: (key: string) => { mem.delete(key); },
+      },
+    });
+    try {
+      await registry.add(row({ id: 'pend', network: 'mainnet', fingerprint: '', lastUsed: 9 }));
+      mem.set('yaw-pending-seed', JSON.stringify({ id: 'pend', phrase }));
+      engine.queueWallet({ accounts: [] });
+      await app.boot({ restoreLatest: true });
+      expect(app.screen.get()).toBe('wallet');
+      expect(app.walletInfo.get()?.id).toBe('pend');
+      expect(app.backupPending.get()).toBe(false);
+      expect((await registry.get('pend'))?.fingerprint).toMatch(/^[a-z2-7]{4}$/);
+      expect(mem.has('yaw-pending-seed')).toBe(false);
+      expect(engine.opens).toHaveLength(1);
+    } finally {
+      if (previous === undefined) delete (globalThis as { sessionStorage?: Storage }).sessionStorage;
+      else Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, value: previous });
+    }
+  });
+
+  it('reload opens the newest wallet even when the default network is the other one', async () => {
+    await registry.add(row({ id: 'm', network: 'mainnet', lastUsed: 10 }));
+    await registry.add(row({ id: 't', network: 'testnet', lastUsed: 50 }));
+    engine.queueWallet({ accounts: [{ id: 'acct-t' }] });
+    await app.boot({ restoreLatest: true });
+    expect(app.network.get()).toBe('testnet');
+    expect(app.screen.get()).toBe('wallet');
+    expect(app.walletInfo.get()?.id).toBe('t');
+    expect(app.endpoint.get()).toContain('zcash-testnet');
+  });
+
+  it('reload keeps the chosen network when no wallet is saved', async () => {
+    const saved = new Map<string, string>();
+    const previous = globalThis.localStorage;
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => saved.get(key) ?? null,
+        setItem: (key: string, value: string) => {
+          saved.set(key, value);
+        },
+      },
+    });
+    try {
+      await app.setNetwork('testnet');
+      expect(app.screen.get()).toBe('welcome');
+      const reloaded = createWalletApp({
+        engine: engine.engine,
+        registry,
+        endpoints: DEFAULT_ENDPOINTS,
+        requestPersist: async () => true,
+      });
+      await reloaded.boot({ restoreLatest: true });
+      expect(reloaded.network.get()).toBe('testnet');
+      expect(reloaded.screen.get()).toBe('welcome');
+    } finally {
+      if (previous === undefined) delete (globalThis as { localStorage?: Storage }).localStorage;
+      else Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: previous });
+    }
   });
 
   it('per-network: booting mainnet ignores testnet rows', async () => {
@@ -221,6 +292,7 @@ describe('boot choreography', () => {
   });
 
   it('setNetwork mid-create does not relabel the Wallet onto the other network', async () => {
+    app.network.set('testnet');
     engine.queueWallet({ holdOpen: true });
     const created = await app.onCreate.generate();
     // confirmBackup reaches engine.open synchronously: capture the gate first.
@@ -242,6 +314,7 @@ describe('boot choreography', () => {
     // opens a live client while the testnet create is still in flight.
     // The switch owns the session then; the create may only land its record.
     await registry.add(row({ id: 'm', network: 'mainnet' }));
+    app.network.set('testnet');
     engine.queueWallet({ holdOpen: true }); // create client (testnet)
     const created = await app.onCreate.generate();
     const openBegan = engine.openStarted();
@@ -267,6 +340,7 @@ describe('boot choreography', () => {
     // Same race on the shared flow tail that Restore and View-only import
     // use: the switch's booted session must survive the flow landing.
     await registry.add(row({ id: 'm', network: 'mainnet' }));
+    app.network.set('testnet');
     engine.queueWallet({ holdOpen: true }); // restore client (testnet)
     const openBegan = engine.openStarted();
     const flow = app.onRestore.restore({ phrase: FUNDED_PHRASE, accountIndex: 0, birthday: 'fullScan' });
@@ -281,6 +355,27 @@ describe('boot choreography', () => {
     expect(mainnet.calls).not.toContain('close');
     expect(app.walletInfo.get()?.id).toBe('m');
     expect((await registry.list('testnet'))[0]).toMatchObject({ network: 'testnet', kind: 'seed' });
+  });
+
+  it('settings shows the network choice and leaves the open wallet alone until it changes', async () => {
+    await registry.add(row({ id: 'm' }));
+    await registry.add(row({ id: 't', network: 'testnet' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
+    await app.boot();
+    expect(app.walletInfo.get()?.id).toBe('m');
+    app.openSettings();
+    expect(app.screen.get()).toBe('settings');
+    expect(engine.lastWallet().closed).toBe(false);
+    app.closeSettings();
+    expect(app.screen.get()).toBe('wallet');
+    expect(app.network.get()).toBe('mainnet');
+    app.openSettings();
+    engine.queueWallet({ accounts: [{ id: 'acct-t' }] });
+    await app.setNetwork('testnet');
+    expect(app.screen.get()).toBe('wallet');
+    expect(app.network.get()).toBe('testnet');
+    expect(app.walletInfo.get()?.id).toBe('t');
+    expect(engine.opens[0]!.wallet.closed).toBe(true);
   });
 
   it('a clean boot clears the previous bootError', async () => {
@@ -301,7 +396,7 @@ describe('boot choreography', () => {
     await a.boot();
     expect(a.bootError.get()).toBe('idb down');
     fail = false;
-    await a.setNetwork('mainnet'); // a real switch boots again and must drop the old error
+    await a.setNetwork('testnet'); // a real switch boots again and must drop the old error
     expect(a.screen.get()).toBe('welcome');
     expect(a.bootError.get()).toBeNull();
   });

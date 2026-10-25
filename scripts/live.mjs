@@ -73,16 +73,6 @@ if (!(await tabLocked('Restore')) || !(await tabLocked('View-only'))) {
 }
 console.log('backup gate pending: Restore/View-only tabs disabled');
 
-// A wrong phrase must not dismiss the gate either.
-await page.fill('[aria-label="backup gate"] textarea', 'wrong words here');
-await page.click('text=I saved my phrase');
-await page.waitForSelector('.error', { timeout: 10_000 });
-if (!(await tabLocked('Restore')) || !(await tabLocked('View-only'))) {
-  console.error('tabs unlocked after a wrong-phrase attempt');
-  process.exit(4);
-}
-console.log('wrong phrase rejected; gate still pending');
-
 const words = await page.$$eval('[aria-label="backup gate"] ol.phrase li', (lis) =>
   lis.map((li) => li.textContent.trim().replace(/^\d+\s+/, '')),
 );
@@ -91,11 +81,35 @@ if (words.length !== 24) {
   console.error('expected 24 words, got', words.length);
   process.exit(1);
 }
-await page.fill('[aria-label="backup gate"] textarea', words.join(' '));
+// The gate quizzes 3 random word positions (inputs carry data-word-position).
+const fillQuiz = async (wordAt) => {
+  const positions = await page.$$eval('[aria-label="backup gate"] [data-word-position]', (els) =>
+    els.map((el) => Number(el.getAttribute('data-word-position'))),
+  );
+  if (positions.length !== 3) {
+    console.error('expected 3 quiz inputs, got', positions.length);
+    process.exit(1);
+  }
+  for (const pos of positions) {
+    await page.fill(`[aria-label="backup gate"] [data-word-position="${pos}"]`, wordAt(pos));
+  }
+};
+
+// Wrong words must not dismiss the gate.
+await fillQuiz(() => 'nottheword');
+await page.click('text=I saved my phrase');
+await page.waitForSelector('.error', { timeout: 10_000 });
+if (!(await tabLocked('Restore')) || !(await tabLocked('View-only'))) {
+  console.error('tabs unlocked after a wrong-words attempt');
+  process.exit(4);
+}
+console.log('wrong words rejected; gate still pending');
+
+await fillQuiz((pos) => words[pos - 1]);
 await page.click('text=I saved my phrase');
 console.log('gate confirmed; waiting for wallet screen (wasm+OPFS+lightd)…');
 
-// The wrong-phrase attempt left an .error element on screen; the app clears it
+// The wrong-words attempt left an .error element on screen; the app clears it
 // when a new attempt starts, so let that flush land before racing on it again —
 // otherwise this race could observe the stale error and report a false failure.
 await page.waitForFunction(() => document.querySelector('.error') === null, { timeout: 5_000 }).catch(() => {});

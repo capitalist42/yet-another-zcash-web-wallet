@@ -26,5 +26,5 @@ export const startApp = (): void => {
   if (bootStarted) return;
   bootStarted = true;
   const app = getApp();
-  void app.boot();
+  void app.boot({ restoreLatest: true });
 };

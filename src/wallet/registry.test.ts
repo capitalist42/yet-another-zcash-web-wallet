@@ -37,6 +37,11 @@ describe('registry (IndexedDB)', () => {
     await r.add(row({ id: 'c', network: 'mainnet', lastUsed: 500 }));
     expect((await r.lastUsed('testnet'))?.id).toBe('b');
     expect((await r.lastUsed('mainnet'))?.id).toBe('c');
+    expect((await r.mostRecent())?.id).toBe('c');
+  });
+
+  it('mostRecent is null when nothing is saved', async () => {
+    expect(await freshRegistry().mostRecent()).toBeNull();
   });
 
   it('touch marks the winner and persists', async () => {

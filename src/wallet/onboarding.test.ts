@@ -33,6 +33,8 @@ beforeEach(() => {
     },
     traceSecret: (b) => consumed.push(b),
   });
+  // These cases exercise the flows, not the chain. The product default is mainnet.
+  app.network.set('testnet');
 });
 
 describe('create wallet', () => {
@@ -53,6 +55,9 @@ describe('create wallet', () => {
     expect(app.screen.get()).toBe('wallet');
     expect(app.recovered.get()).toBe(true);
     expect(engine.lastWallet().calls).toContain('startSync');
+    // a new wallet is on the main page at zero, not an empty dash
+    expect(app.balances.get()).toMatchObject({ transparent: 0n, sapling: 0n, ironwood: 0n });
+    expect(app.backupPending.get()).toBe(false);
   });
 
   it('passes the phrase to the engine as UTF-8 bytes, then zeroizes them', async () => {
@@ -120,7 +125,20 @@ describe('create wallet', () => {
     engine.queueWallet({ createFailures: 2 });
     const res = await app.onCreate.confirmBackup(created.phrase);
     expect(res).toMatchObject({ ok: false, code: 'SYNC_REQUIRED' });
-    expect(await registry.list('testnet')).toHaveLength(0);
+    // the shell is already saved, so a reload can find it and finish creation
+    const pending = await registry.list('testnet');
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.fingerprint).toBe('');
+    // still the main page: zero balance, sync visible, phrase kept for retry
+    expect(app.screen.get()).toBe('wallet');
+    expect(app.balances.get()).toMatchObject({ transparent: 0n, sapling: 0n, ironwood: 0n });
+    expect(app.sync.get()?.activity).toBe('failed');
+    expect(app.backupPending.get()).toBe(true);
+    const resumed = await app.onCreate.resume();
+    expect(resumed.ok).toBe(true);
+    expect(await registry.list('testnet')).toHaveLength(1);
+    expect(app.backupPending.get()).toBe(false);
+    expect(engine.opens).toHaveLength(1);
   });
 
 });

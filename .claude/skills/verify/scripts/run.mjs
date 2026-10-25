@@ -120,13 +120,13 @@ const snap = async (name) => {
 
 // =============================================================================
 // create-wallet — features/create-wallet.md
-// welcome -> Create -> forced backup gate (24 words, wrong-phrase rejected,
-// right phrase opens the engine) -> wallet screen (or, on testnet, the honest
+// welcome -> Create -> forced backup gate (24 words shown, 3 random positions
+// quizzed; wrong words rejected, right words open the engine) -> wallet screen (or, on testnet, the honest
 // SYNC_REQUIRED) -> second tab storage-busy -> reload boots straight back.
 // =============================================================================
 async function driveCreateWallet() {
   let fpBefore = ''; // fingerprint chip observed before reload; equality proves same wallet
-  let staleError = ''; // .error text left over from the wrong-phrase leg; the outcome race must not match it
+  let staleError = ''; // .error text left over from the wrong-words leg; the outcome race must not match it
   const url = `${BASE}/?network=${network}`;
 
   await step('open-welcome', async () => {
@@ -156,18 +156,29 @@ async function driveCreateWallet() {
   });
   await snap('gate');
 
-  await step('gate-rejects-wrong-phrase', async () => {
-    await page.fill('[aria-label="backup gate"] textarea', 'wrong words do not open a wallet');
+  // The gate quizzes 3 random word positions; inputs carry data-word-position.
+  const fillQuiz = async (wordAt) => {
+    const positions = await page.$$eval('[aria-label="backup gate"] [data-word-position]', (els) =>
+      els.map((el) => Number(el.getAttribute('data-word-position'))),
+    );
+    if (positions.length !== 3) throw new Error(`expected 3 quiz inputs, got ${positions.length}`);
+    for (const pos of positions) {
+      await page.fill(`[aria-label="backup gate"] [data-word-position="${pos}"]`, wordAt(pos));
+    }
+  };
+
+  await step('gate-rejects-wrong-words', async () => {
+    await fillQuiz(() => 'nottheword');
     await page.click('text=I saved my phrase');
     await page.waitForSelector('.error', { timeout: 15_000 });
     const stillGate = await page.locator('[aria-label="backup gate"]').count();
-    if (stillGate !== 1) throw new Error('gate vanished despite wrong phrase');
+    if (stillGate !== 1) throw new Error('gate vanished despite wrong words');
     staleError = (await page.textContent('.error')).trim();
     return `error shown: "${staleError}"`;
   });
 
   await step('gate-confirm', async () => {
-    await page.fill('[aria-label="backup gate"] textarea', globalThis.__words.join(' '));
+    await fillQuiz((pos) => globalThis.__words[pos - 1]);
     await page.click('text=I saved my phrase');
     log('gate confirmed; waiting for wallet screen (wasm + OPFS + lightd)…');
   });
@@ -182,7 +193,7 @@ async function driveCreateWallet() {
         .waitForFunction(
           (stale) => {
             const t = (document.querySelector('.error')?.textContent ?? '').trim();
-            return t !== '' && t !== stale; // fresh error only — the wrong-phrase text may linger until resolution
+            return t !== '' && t !== stale; // fresh error only — the wrong-words text may linger until resolution
           },
           staleError,
           { timeout: 240_000 },
@@ -197,7 +208,14 @@ async function driveCreateWallet() {
       // is "Sync the wallet before continuing; retain any existing payment operation."
       if (!/SYNC_REQUIRED|Sync the wallet before continuing/i.test(err + bodyText))
         throw new Error(`testnet error is not the honest sync failure: "${err}"`);
-      return `honest testnet failure observed: "${err.slice(0, 160)}"`;
+      // SYNC_REQUIRED is a pause, not a dead end: the retry screen explains the
+      // pause and offers Try again / Switch to Mainnet / Back to my phrase.
+      await page.waitForSelector('[aria-label="sync retry"]', { timeout: 5_000 });
+      if (!(await page.isVisible('text=Try again')) || !(await page.isVisible('text=Back to my recovery phrase')))
+        throw new Error('sync-retry screen missing its recovery actions');
+      await page.click('text=Back to my recovery phrase');
+      await page.waitForSelector('[aria-label="backup gate"]', { timeout: 5_000 });
+      return `honest testnet failure with working retry screen: "${err.slice(0, 160)}"`;
     }
     if (race !== 'wallet') {
       const err = await page

@@ -50,6 +50,7 @@ const mapError = (e: unknown): EngineError => {
     'SIGNER_REQUIRED',
     'SYNC_REQUIRED',
     'TIMEOUT',
+    'RUNTIME_UNAVAILABLE',
   ];
   // ACCOUNT_BUSY is the same lease collision the UI renders as storage-busy.
   const code: EngineErrorCode = known.includes(e.code as EngineErrorCode)

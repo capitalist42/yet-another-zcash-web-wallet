@@ -3,11 +3,21 @@
 import { useEffect, useState } from 'react';
 import { useStore } from '@nanostores/react';
 import { getApp, startApp } from './wiring';
-import type { RestoreBirthday } from '../wallet/app';
+import type { ImportResult, RestoreBirthday } from '../wallet/app';
 import type { EngineHistoryEntry, NetworkId } from '../wallet/engine/port';
 import { formatZats } from '../wallet/units';
 
 const app = getApp();
+
+/** Onboarding failure text, keyed on the engine code (plan: UX builds on
+ * ZcashError codes). RUNTIME_UNAVAILABLE here is the artifact loader refusing
+ * bytes whose integrity pin mismatches — a tab open across a rebuild asks for
+ * asset hashes the server no longer has, and only a reload pulls the new
+ * bundle. Say so, or the user retries the same stale page forever. */
+const errorText = (res: ImportResult, fallback: string): string =>
+  res.code === 'RUNTIME_UNAVAILABLE'
+    ? `${res.message ?? 'Engine runtime unavailable.'} Reload the page and try again.`
+    : (res.message ?? res.code ?? fallback);
 
 /** Shared birthday choice (full scan vs explicit height) — one shape for
  * Restore and View-only import (Zashi-compat import path). */
@@ -45,11 +55,32 @@ function SyncBar() {
   if (sync === null) return <p className="muted">Sync: preparing…</p>;
   const scanned = sync.scanned === null ? '—' : sync.scanned.toLocaleString('en-US');
   const target = sync.target === null ? '—' : sync.target.toLocaleString('en-US');
+  const known = sync.scanned !== null && sync.target !== null && sync.target > 0;
+  const pct = known ? Math.min(100, Math.round((sync.scanned! / sync.target!) * 100)) : null;
+  const label = sync.targetReached ? 'Wallet synced' : sync.activity === 'failed' ? 'Sync failed' : 'Syncing wallet';
   return (
-    <p className="muted">
-      Sync: {sync.activity} · scanned {scanned} / {target}
-      {sync.targetReached ? ' · up to date' : ''}
-    </p>
+    <div className="sync" aria-label="sync">
+      <div className="row">
+        <span>{label}</span>
+        <span className="muted">{pct === null ? sync.activity : `${pct}%`}</span>
+      </div>
+      <div
+        className="sync-track"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct ?? undefined}
+      >
+        <div
+          className={pct === null && sync.activity === 'running' ? 'sync-fill indeterminate' : 'sync-fill'}
+          style={pct === null ? undefined : { width: `${pct}%` }}
+        />
+      </div>
+      <p className="muted">
+        scanned {scanned} / {target}
+        {sync.targetReached ? ' · up to date' : ''}
+      </p>
+    </div>
   );
 }
 
@@ -96,38 +127,35 @@ function WalletScreen() {
   const pending = useStore(app.pendingCount);
   const canSpend = useStore(app.canSpend);
   const endpoint = useStore(app.endpoint);
-  const network = useStore(app.network);
+  const gatePending = useStore(app.backupPending);
+  const creating = useStore(app.creating);
   if (info === null) return null;
   return (
     <section className="screen" aria-label="wallet">
       <header className="row">
         <h1>
-          {info.name} <span className="chip">{info.fingerprint}</span>
+          {info.name}{info.fingerprint !== '' && <span className="chip">{info.fingerprint}</span>}
           {info.kind === 'viewonly' && <span className="chip">View-only</span>}
           {/* ADR-0001: the endpoint operator is a party to your privacy. */}
           <span className="chip">{new URL(endpoint).host}</span>
         </h1>
-        <button type="button" onClick={() => void app.setNetwork(network === 'testnet' ? 'mainnet' : 'testnet')}>
-          Switch to {network === 'testnet' ? 'mainnet' : 'testnet'}
+        <button type="button" className="secondary" onClick={() => app.openSettings()}>
+          Settings
         </button>
       </header>
       <SyncBar />
       {pending > 0 && <p className="chip warn">Pending Payments: {pending}</p>}
-      {balances === null ? (
-        <p className="muted">Balances: waiting for first scan…</p>
-      ) : (
-        <ul className="balances">
-          <li>
-            Transparent <strong>{balances.transparent === null ? '—' : formatZats(balances.transparent)}</strong>
-          </li>
-          <li>
-            Sapling <strong>{balances.sapling === null ? '—' : formatZats(balances.sapling)}</strong>
-          </li>
-          <li>
-            Ironwood <strong>{balances.ironwood === null ? '—' : formatZats(balances.ironwood)}</strong>
-          </li>
-        </ul>
-      )}
+      <ul className="balances">
+        <li>
+          Transparent <strong>{formatZats(balances?.transparent ?? 0n)}</strong>
+        </li>
+        <li>
+          Sapling <strong>{formatZats(balances?.sapling ?? 0n)}</strong>
+        </li>
+        <li>
+          Ironwood <strong>{formatZats(balances?.ironwood ?? 0n)}</strong>
+        </li>
+      </ul>
       <div className="receive">
         <h2>Receive Address</h2>
         <p className="address" data-testid="receive-address">
@@ -137,12 +165,19 @@ function WalletScreen() {
         </p>
       </div>
       <div className="actions">
-        {canSpend ? (
+        {gatePending ? (
+          <p className="muted">New wallet. The balance stays at zero until a payment arrives.</p>
+        ) : canSpend ? (
           <button type="button" disabled title="Send ships in the next milestone">
             Send
           </button>
         ) : (
           <p className="muted">No spend authority — this Wallet is view-only.</p>
+        )}
+        {gatePending && !creating && (
+          <button type="button" onClick={() => void app.onCreate.resume()}>
+            Try again
+          </button>
         )}
       </div>
       <div className="history-section">
@@ -153,15 +188,44 @@ function WalletScreen() {
   );
 }
 
+/** Distinct 1-based word positions the backup quiz asks for (sorted). */
+const quizPositions = (count: number, length = 24): number[] => {
+  const picked = new Set<number>();
+  while (picked.size < count) picked.add(Math.floor(Math.random() * length) + 1);
+  return [...picked].sort((a, b) => a - b);
+};
+
 function CreateFlow() {
   const [phase, setPhase] = useState<'form' | 'backup'>('form');
   const [phrase, setPhrase] = useState('');
+  const [quiz, setQuiz] = useState<number[]>([]);
+  const [answers, setAnswers] = useState<Record<number, string>>({});
   const [error, setError] = useState<string | null>(null);
-  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState(false);
   const start = async (): Promise<void> => {
     const session = await app.onCreate.generate();
     setPhrase(session.phrase);
+    setQuiz(quizPositions(3));
+    setAnswers({});
     setPhase('backup');
+  };
+  // The confirmed phrase is already verified locally and by the service gate;
+  // re-submitting it costs nothing — the phrase session stays in flight until
+  // a wallet is created, so SYNC_REQUIRED is a pause, not a dead end.
+  const submitPhrase = async (): Promise<void> => {
+    setBusy(true);
+    // A fresh attempt never keeps the previous attempt's message —
+    // otherwise a stale .error element can outlive its cause.
+    setError(null);
+    try {
+      const res = await app.onCreate.confirmBackup(phrase);
+      if (res.ok) return; // the service flips the screen to the wallet
+      // SYNC_REQUIRED also lands on the wallet page (zero balance, sync bar).
+      // Only a rejection that never left this gate stays here.
+      if (res.code !== 'SYNC_REQUIRED') setError(errorText(res, 'phrase mismatch'));
+    } finally {
+      setBusy(false);
+    }
   };
   if (phase === 'form') {
     return (
@@ -170,34 +234,49 @@ function CreateFlow() {
       </button>
     );
   }
-  // Forced backup gate: no dismiss control; only the matching phrase exits.
+  // Forced backup gate: no dismiss control; only the right words exit it.
+  const words = phrase.split(' ');
   return (
     <section className="gate" aria-label="backup gate">
       <h2>Write down your Recovery Phrase</h2>
       <ol className="phrase">
-        {phrase.split(' ').map((w, i) => (
+        {words.map((w, i) => (
           <li key={i}>
             <span className="num">{i + 1}</span> {w}
           </li>
         ))}
       </ol>
       <p>Anyone with these words controls your funds. No one can reset them for you.</p>
-      <label>
-        Type all 24 words in order to confirm
-        <textarea value={confirm} onChange={(e) => setConfirm(e.target.value)} rows={3} />
-      </label>
+      <p>To confirm you wrote them down, enter these 3 words from your phrase:</p>
+      {quiz.map((pos) => (
+        <label key={pos}>
+          Word #{pos}
+          <input
+            data-word-position={pos}
+            value={answers[pos] ?? ''}
+            onChange={(e) => setAnswers({ ...answers, [pos]: e.target.value })}
+            autoComplete="off"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+        </label>
+      ))}
       {error !== null && <p className="error">{error}</p>}
       <button
         type="button"
-        onClick={async () => {
-          // A fresh attempt never keeps the previous attempt's message —
-          // otherwise a stale .error element can outlive its cause.
-          setError(null);
-          const res = await app.onCreate.confirmBackup(confirm);
-          setError(res.ok ? null : (res.message ?? 'phrase mismatch'));
+        disabled={busy}
+        onClick={() => {
+          // Spot-check locally (the words are on screen anyway); the service
+          // gate below still receives — and re-verifies — the full phrase.
+          if (quiz.some((pos) => (answers[pos] ?? '').trim().toLowerCase() !== words[pos - 1])) {
+            setError("Those words don't match your phrase — check what you wrote down and try again.");
+            return;
+          }
+          void submitPhrase();
         }}
       >
-        I saved my phrase
+        {busy ? 'Creating…' : 'I saved my phrase'}
       </button>
     </section>
   );
@@ -236,7 +315,7 @@ function RestoreFlow() {
             accountIndex: Number(accountIndex),
             birthday: birthdayChoice(fullScan, height),
           });
-          setError(res.ok ? null : (res.message ?? res.code ?? 'restore failed'));
+          setError(res.ok ? null : errorText(res, 'restore failed'));
         }}
       >
         Restore
@@ -263,7 +342,7 @@ function ViewOnlyFlow() {
         type="button"
         onClick={async () => {
           const res = await app.onViewOnly.import({ viewingKey: key, birthday: birthdayChoice(fullScan, height) });
-          setError(res.ok ? null : (res.message ?? res.code ?? 'import failed'));
+          setError(res.ok ? null : errorText(res, 'import failed'));
         }}
       >
         Import
@@ -280,7 +359,12 @@ function WelcomeScreen() {
   const gatePending = useStore(app.backupPending);
   return (
     <section className="screen" aria-label="welcome">
-      <h1>Zcash Wallet</h1>
+      <header className="row">
+        <h1>Zcash Wallet</h1>
+        <button type="button" className="secondary" onClick={() => app.openSettings()}>
+          Settings
+        </button>
+      </header>
       {/* ADR-0001: one-sentence onboarding disclosure. */}
       <p className="muted">Your lightwalletd provider can see your activity.</p>
       {error !== null && <p className="error">{error}</p>}
@@ -314,6 +398,61 @@ function WelcomeScreen() {
   );
 }
 
+
+function SettingsScreen() {
+  const network = useStore(app.network);
+  const endpoint = useStore(app.endpoint);
+  const [busy, setBusy] = useState(false);
+  const choose = async (next: NetworkId): Promise<void> => {
+    if (next === network) {
+      app.closeSettings();
+      return;
+    }
+    setBusy(true);
+    try {
+      await app.setNetwork(next);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="screen" aria-label="settings">
+      <header className="row">
+        <h1>Settings</h1>
+        <button type="button" className="secondary" disabled={busy} onClick={() => app.closeSettings()}>
+          Back
+        </button>
+      </header>
+      <h2>Network</h2>
+      <p className="muted">Each network has its own wallets. Switching closes the one that is open.</p>
+      <div className="choices" role="radiogroup" aria-label="Network">
+        <button
+          type="button"
+          role="radio"
+          aria-checked={network === 'mainnet'}
+          className={network === 'mainnet' ? 'on' : ''}
+          disabled={busy}
+          onClick={() => void choose('mainnet')}
+        >
+          Mainnet
+        </button>
+        <button
+          type="button"
+          role="radio"
+          aria-checked={network === 'testnet'}
+          className={network === 'testnet' ? 'on' : ''}
+          disabled={busy}
+          onClick={() => void choose('testnet')}
+        >
+          Testnet
+        </button>
+      </div>
+      <p className="muted">
+        Lightwalletd <span className="chip">{new URL(endpoint).host}</span>
+      </p>
+    </section>
+  );
+}
 export default function App() {
   useEffect(() => {
     startApp();
@@ -325,6 +464,7 @@ export default function App() {
       {screen === 'booting' && <p className="screen">Loading your Wallet…</p>}
       {screen === 'welcome' && <WelcomeScreen />}
       {screen === 'wallet' && <WalletScreen />}
+      {screen === 'settings' && <SettingsScreen />}
       {screen === 'storage-busy' && (
         <section className="screen" aria-label="storage busy">
           <h1>Wallet storage is busy</h1>

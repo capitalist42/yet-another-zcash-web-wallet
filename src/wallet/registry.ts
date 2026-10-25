@@ -26,6 +26,8 @@ export interface Registry {
   touch(id: string): Promise<void>;
   /** Latest-opened for one network. */
   lastUsed(network: WalletRecord['network']): Promise<WalletRecord | null>;
+  /** Latest-opened wallet on any network. Null when the registry is empty. */
+  mostRecent(): Promise<WalletRecord | null>;
   list(network: WalletRecord['network']): Promise<WalletRecord[]>;
   get(id: string): Promise<WalletRecord | null>;
   remove(id: string): Promise<void>;
@@ -47,6 +49,10 @@ export const createRegistry = (store: RegistryStore): Registry => ({
       .filter((r) => r.network === network)
       .sort((a, b) => b.lastUsed - a.lastUsed);
     return rows[0] ?? null;
+  },
+  async mostRecent() {
+    const all = await store.getAll();
+    return all.sort((a, b) => b.lastUsed - a.lastUsed)[0] ?? null;
   },
   async list(network) {
     const all = await store.getAll();
