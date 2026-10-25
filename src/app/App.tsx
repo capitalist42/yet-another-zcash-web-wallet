@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useStore } from '@nanostores/react';
 import { getApp, startApp } from './wiring';
-import type { ImportResult, RestoreBirthday, SendNotice } from '../wallet/app';
+import type { ImportResult, RememberChoice, RestoreBirthday, SendNotice } from '../wallet/app';
 import type { EngineHistoryEntry, EngineProposal, NetworkId } from '../wallet/engine/port';
 import { formatZats } from '../wallet/units';
 import { overallProgress } from '../wallet/sync-progress';
@@ -160,6 +160,10 @@ const noticeText = (notice: SendNotice): string | null => {
       return 'This Wallet cannot send right now.';
     case 'view-only':
       return 'No spend authority — this Wallet is view-only.';
+    case 'locked':
+      // CONTEXT.md: Lock is the session-level loss of spend authority; the
+      // Wallet stays open for viewing. Say what unlocks it.
+      return 'This Wallet is locked. Unlock it to send.';
     case 'phrase':
       return 'Enter the 24-word recovery phrase for this Wallet.';
     case 'engine':
@@ -320,12 +324,86 @@ function SendFlow() {
   );
 }
 
+/** Auto-Lock countdown chip (issue #6): visible only while unlocked. The
+ * deadline is activity-based — a send attempt resets it, watching sync does
+ * not — and there is no hard cap, so this is the only honest countdown. */
+function AutoLockChip() {
+  const autoLockInMs = useStore(app.autoLockInMs);
+  if (autoLockInMs === null) return null;
+  const minutes = Math.max(0, Math.ceil(autoLockInMs / 60_000));
+  return (
+    <span className="chip warn" data-testid="auto-lock-chip">
+      Auto-Lock in ~{minutes} min
+    </span>
+  );
+}
+
+/** Unlock the open Wallet (issue #6). Remembered seeds present the Vault
+ * passphrase field; Never-store seeds re-enter the recovery phrase. Both
+ * attach the signer — neither ever auto-decrypts at startup. */
+function UnlockPanel() {
+  const hasVault = useStore(app.hasVault);
+  const [secret, setSecret] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const submit = async (passphrasePath: boolean): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = passphrasePath ? await app.unlock(secret) : await app.unlockWithPhrase(secret);
+      if (!res.ok) setError(errorText(res, 'unlock failed'));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="form" aria-label="unlock session">
+      <h2>Wallet locked</h2>
+      <p className="muted">
+        Viewing continues. Spend authority returns only after Unlock — and lapses
+        again after 10 idle minutes (Auto-Lock).
+      </p>
+      <label>
+        {hasVault ? 'Vault passphrase' : 'Recovery Phrase'}
+        {hasVault ? (
+          <input
+            type="password"
+            value={secret}
+            data-testid="unlock-secret"
+            autoComplete="off"
+            onChange={(e) => setSecret(e.target.value)}
+          />
+        ) : (
+          <textarea
+            rows={3}
+            value={secret}
+            data-testid="unlock-secret"
+            onChange={(e) => setSecret(e.target.value)}
+          />
+        )}
+      </label>
+      {error !== null && <p className="error" data-testid="unlock-error">{error}</p>}
+      <div className="choices">
+        <button
+          type="button"
+          disabled={busy || secret.length === 0}
+          data-testid="unlock-submit"
+          onClick={() => void submit(hasVault)}
+        >
+          {busy ? 'Unlocking…' : 'Unlock'}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function WalletScreen() {
   const info = useStore(app.walletInfo);
   const balances = useStore(app.balances);
   const address = useStore(app.address);
   const pending = useStore(app.pendingCount);
   const canSpend = useStore(app.canSpend);
+  const unlocked = useStore(app.unlocked);
   const endpoint = useStore(app.endpoint);
   const gatePending = useStore(app.backupPending);
   const creating = useStore(app.creating);
@@ -340,10 +418,25 @@ function WalletScreen() {
           <NetworkChip />
           {/* ADR-0001: the endpoint operator is a party to your privacy. */}
           <span className="chip">{new URL(endpoint).host}</span>
+          <AutoLockChip />
         </h1>
-        <button type="button" className="secondary" onClick={() => app.openSettings()}>
-          Settings
-        </button>
+        <div className="choices">
+          {info.kind === 'seed' && unlocked && (
+            // Lock is app-wide (issue #6): every open Wallet on both Networks
+            // loses spend authority. The chip in the header tells the truth.
+            <button
+              type="button"
+              className="secondary"
+              data-testid="lock-button"
+              onClick={() => void app.lock()}
+            >
+              Lock
+            </button>
+          )}
+          <button type="button" className="secondary" onClick={() => app.openSettings()}>
+            Settings
+          </button>
+        </div>
       </header>
       <SyncBar />
       {pending > 0 && <p className="chip warn">Pending Payments: {pending}</p>}
@@ -375,6 +468,10 @@ function WalletScreen() {
           </button>
         ) : canSpend ? (
           <SendFlow />
+        ) : info.kind === 'seed' ? (
+          // A seed Wallet that is not unlocked is locked (issue #6): the
+          // Unlock panel replaces Send; viewing above stays live.
+          <UnlockPanel />
         ) : (
           <p className="muted">No spend authority — this Wallet is view-only.</p>
         )}
@@ -399,6 +496,84 @@ const quizPositions = (count: number, length = 24): number[] => {
   return [...picked].sort((a, b) => a - b);
 };
 
+// Custody choice (ADR-0002, issue #6): the Remember/Never-store decision plus
+// its Vault passphrase pair, shared verbatim by the create and restore flows.
+// Distinct from a BIP39 passphrase — this one keys the local envelope.
+const useCustody = (radioName: string) => {
+  const [remember, setRemember] = useState(false);
+  const [vaultPass, setVaultPass] = useState('');
+  const [vaultPass2, setVaultPass2] = useState('');
+  const fields = (
+    <fieldset className="custody" aria-label="custody choice">
+      <legend>Keep this Wallet unlocked on this device?</legend>
+      <label>
+        <input
+          type="radio"
+          name={radioName}
+          checked={!remember}
+          onChange={() => setRemember(false)}
+          data-testid="custody-never"
+        />
+        Never store
+      </label>
+      <label>
+        <input
+          type="radio"
+          name={radioName}
+          checked={remember}
+          onChange={() => setRemember(true)}
+          data-testid="custody-remember"
+        />
+        Remember on this device (encrypted)
+      </label>
+      <p className="muted">
+        {remember
+          ? 'Your seed is stored encrypted (AES-GCM, key stretched 210k times) and unlocked with this passphrase until Auto-Lock. A wrong passphrase never yields the seed.'
+          : 'Nothing about this seed is stored. You will re-enter the phrase when you want to send.'}
+      </p>
+      {remember && (
+        <>
+          <label>
+            Vault passphrase
+            <input
+              type="password"
+              value={vaultPass}
+              onChange={(e) => setVaultPass(e.target.value)}
+              data-testid="vault-pass"
+              autoComplete="new-password"
+            />
+          </label>
+          <label>
+            Repeat passphrase
+            <input
+              type="password"
+              value={vaultPass2}
+              onChange={(e) => setVaultPass2(e.target.value)}
+              data-testid="vault-pass2"
+              autoComplete="new-password"
+            />
+          </label>
+          <p className="muted">
+            There is no recovery for this passphrase — losing it means restoring from the phrase.
+          </p>
+        </>
+      )}
+    </fieldset>
+  );
+  // Validation lives here, at the UI boundary: the service also refuses
+  // Remember without a passphrase, but a local check keeps the user on the
+  // form with a precise message.
+  const validate = (): { choice: RememberChoice } | { error: string } => {
+    if (remember && vaultPass.length === 0) {
+      return { error: 'Choose a passphrase for the encrypted Vault (or pick Never store).' };
+    }
+    if (remember && vaultPass !== vaultPass2) {
+      return { error: 'The two passphrases do not match.' };
+    }
+    return { choice: { remember, ...(remember ? { vaultPassphrase: vaultPass } : {}) } };
+  };
+  return { fields, validate };
+};
 function CreateFlow() {
   const [phase, setPhase] = useState<'form' | 'backup'>('form');
   const [phrase, setPhrase] = useState('');
@@ -406,6 +581,7 @@ function CreateFlow() {
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const custody = useCustody('custody');
   const start = async (): Promise<void> => {
     const session = await app.onCreate.generate();
     setPhrase(session.phrase);
@@ -416,13 +592,13 @@ function CreateFlow() {
   // The confirmed phrase is already verified locally and by the service gate;
   // re-submitting it costs nothing — the phrase session stays in flight until
   // a wallet is created, so SYNC_REQUIRED is a pause, not a dead end.
-  const submitPhrase = async (): Promise<void> => {
+  const submitPhrase = async (choice: RememberChoice): Promise<void> => {
     setBusy(true);
     // A fresh attempt never keeps the previous attempt's message —
     // otherwise a stale .error element can outlive its cause.
     setError(null);
     try {
-      const res = await app.onCreate.confirmBackup(phrase);
+      const res = await app.onCreate.confirmBackup(phrase, choice);
       if (res.ok) return; // the service flips the screen to the wallet
       // SYNC_REQUIRED also lands on the wallet page (zero balance, sync bar).
       // Only a rejection that never left this gate stays here.
@@ -466,18 +642,24 @@ function CreateFlow() {
           />
         </label>
       ))}
+      {custody.fields}
       {error !== null && <p className="error">{error}</p>}
       <button
         type="button"
         disabled={busy}
         onClick={() => {
+          const custodyResult = custody.validate();
+          if ('error' in custodyResult) {
+            setError(custodyResult.error);
+            return;
+          }
           // Spot-check locally (the words are on screen anyway); the service
           // gate below still receives — and re-verifies — the full phrase.
           if (quiz.some((pos) => (answers[pos] ?? '').trim().toLowerCase() !== words[pos - 1])) {
             setError("Those words don't match your phrase — check what you wrote down and try again.");
             return;
           }
-          void submitPhrase();
+          void submitPhrase(custodyResult.choice);
         }}
       >
         {busy ? 'Creating…' : 'I saved my phrase'}
@@ -493,6 +675,7 @@ function RestoreFlow() {
   const [fullScan, setFullScan] = useState(true);
   const [height, setHeight] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const custody = useCustody('restore-custody');
   return (
     <section className="form" aria-label="restore">
       <h2>Restore an existing Wallet</h2>
@@ -509,15 +692,23 @@ function RestoreFlow() {
         <input value={accountIndex} onChange={(e) => setAccountIndex(e.target.value)} inputMode="numeric" />
       </label>
       <BirthdayFields fullScan={fullScan} height={height} onFullScan={setFullScan} onHeight={setHeight} />
+      {custody.fields}
       {error !== null && <p className="error">{error}</p>}
       <button
         type="button"
         onClick={async () => {
+          const custodyResult = custody.validate();
+          if ('error' in custodyResult) {
+            setError(custodyResult.error);
+            return;
+          }
+          const choice = custodyResult.choice;
           const res = await app.onRestore.restore({
             phrase,
             passphrase,
             accountIndex: Number(accountIndex),
             birthday: birthdayChoice(fullScan, height),
+            custody: choice,
           });
           setError(res.ok ? null : errorText(res, 'restore failed'));
         }}

@@ -8,6 +8,7 @@ import { createFakeEngine, type FakeEngine } from './engine/fake';
 import { createWalletApp, type WalletApp } from './app';
 import { DEFAULT_ENDPOINTS } from './policy';
 import type { EngineProposal } from './engine/port';
+import { createVault, idbVaultStore } from './vault';
 
 const SAPLING =
   'ztestsapling10yy2ex5dcqkclhc7z7yrnjq2z6feyjad56ptwlfgmy77dmaqqrl9gyhprdx59qgmsnyfska2kez';
@@ -42,6 +43,7 @@ beforeEach(() => {
   app = createWalletApp({
     engine: engine.engine,
     registry,
+    vault: createVault(idbVaultStore()),
     endpoints: DEFAULT_ENDPOINTS,
     requestPersist: async () => true,
   });
@@ -188,7 +190,9 @@ describe('send error recovery', () => {
     expect(app.send.get()).toMatchObject({ phase: 'review', proposal: { proposalId: 'prop-reviewed' } });
     await app.onSend.confirm();
     expect(wallet.sentProposalIds).toEqual(['prop-reviewed', 'prop-reviewed']);
-    expect(wallet.attachArgs).toHaveLength(1);
+    // Issue #6: create attaches once (unlock-after-create); the failed send's
+    // reattach-signer recovery attaches once more — the newest entry is that.
+    expect(wallet.attachArgs).toHaveLength(2);
     expect(app.send.get()).toEqual({ phase: 'sent', txid: 'cafe' });
   });
 

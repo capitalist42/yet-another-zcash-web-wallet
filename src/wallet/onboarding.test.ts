@@ -8,6 +8,7 @@ import { createFakeEngine, type FakeEngine } from './engine/fake';
 import { createWalletApp, type WalletApp } from './app';
 import { DEFAULT_ENDPOINTS } from './policy';
 import { validatePhrase } from './keys';
+import { createVault, idbVaultStore } from './vault';
 
 // A valid test vector phrase (all-zero entropy) for restore tests.
 const FUNDED_PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -26,6 +27,7 @@ beforeEach(() => {
   app = createWalletApp({
     engine: engine.engine,
     registry,
+    vault: createVault(idbVaultStore()),
     endpoints: DEFAULT_ENDPOINTS,
     requestPersist: async () => {
       persistCalls += 1;
@@ -342,6 +344,7 @@ describe('failed flow leaves no dangling client (fake-engine seam)', () => {
     const app2 = createWalletApp({
       engine: engine.engine,
       registry: brokenRegistry,
+      vault: createVault(idbVaultStore()),
       endpoints: DEFAULT_ENDPOINTS,
       requestPersist: async () => true,
     });

@@ -215,6 +215,9 @@ export interface EngineWallet {
   abandon(operationId: string): Promise<void>;
   /** Restore spend authority for an existing seed account and attach it. */
   attachSigner(args: { accountId: string; mnemonic: Uint8Array }): Promise<void>;
+  /** Drop spend authority for one account (Lock, app-wide or per-wallet).
+   * Viewing continues; the SDK DB keeps its viewing keys + history. */
+  detachSigner(args: { accountId: string }): Promise<void>;
   close(): Promise<void>;
 }
 

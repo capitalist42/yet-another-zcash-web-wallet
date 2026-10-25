@@ -105,9 +105,16 @@ if (!(await tabLocked('Restore')) || !(await tabLocked('View-only'))) {
 }
 console.log('wrong words rejected; gate still pending');
 
+// Custody choice (#6): pick Remember so the reload below must come back
+// unlocked via the sessionStorage mirror — Never-store would also render
+// the wallet screen (locked), so the reload assertion needs the Remember
+// path to mean anything.
+await page.click('[data-testid="custody-remember"]');
+await page.fill('[data-testid="vault-pass"]', 'live-harness-pass');
+await page.fill('[data-testid="vault-pass2"]', 'live-harness-pass');
 await fillQuiz((pos) => words[pos - 1]);
 await page.click('text=I saved my phrase');
-console.log('gate confirmed; waiting for wallet screen (wasm+OPFS+lightd)…');
+console.log('gate confirmed (Remember custody); waiting for wallet screen (wasm+OPFS+lightd)…');
 
 // The wrong-words attempt left an .error element on screen; the app clears it
 // when a new attempt starts, so let that flush land before racing on it again —
@@ -148,7 +155,32 @@ if (outcome === 'wallet') {
     .then(() => true)
     .catch(() => false);
   console.log('reload boots straight into wallet:', reborn);
-  if (!busy || !reborn) process.exitCode = 3;
+  // Remember custody: within the idle deadline and no Lock flag, the mirror
+  // must restore spend authority (#6 lifetime rule).
+  const stillUnlocked = await page
+    .waitForSelector('[data-testid="lock-button"]', { timeout: 30_000 })
+    .then(() => true)
+    .catch(() => false);
+  console.log('reload within deadline → still unlocked:', stillUnlocked);
+  // Lock (#6): removes spend authority; Unlock panel replaces Send.
+  if (stillUnlocked) {
+    await page.click('[data-testid="lock-button"]');
+    const lockPanel = await page
+      .waitForSelector('[aria-label="unlock session"]', { timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
+    console.log('Lock → unlock panel shown:', lockPanel);
+    await page.reload({ waitUntil: 'networkidle' });
+    const afterLockReload = await page
+      .waitForSelector('[aria-label="unlock session"]', { timeout: 120_000 })
+      .then(() => true)
+      .catch(() => false);
+    console.log('Lock → reload → still locked despite mirror:', afterLockReload);
+    if (!lockPanel || !afterLockReload) process.exitCode = 3;
+  } else {
+    process.exitCode = 3;
+  }
+  if (!busy || !reborn || !stillUnlocked) process.exitCode = 3;
 }
 await page.screenshot({ path: '/tmp/yaw-live.png' });
 await browser.close();

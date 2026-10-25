@@ -416,6 +416,21 @@ class AdapterWallet implements EngineWallet {
     }
   }
 
+  async detachSigner(args: { accountId: string }): Promise<void> {
+    // Drop spend authority for one account (Lock). The SDK's detachSigner
+    // unbinds the signer from the client; disposing the cached MemorySigner
+    // zeroizes its in-memory key material. Viewing continues — the SDK DB
+    // keeps its viewing keys + history.
+    const signer = this.signers.get(args.accountId);
+    this.signers.delete(args.accountId);
+    if (signer !== undefined) await signer.dispose().catch(() => undefined);
+    try {
+      await this.client.accounts.detachSigner({ accountId: args.accountId as AccountId });
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
   async listOperations(): Promise<readonly EngineOperation[]> {
     try {
       const page = await this.client.operations.list();

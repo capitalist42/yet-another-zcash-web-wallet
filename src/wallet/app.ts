@@ -24,6 +24,7 @@ import { fingerprintFromUfvk } from './fingerprint';
 import { generatePhrase, normalizePhrase, phraseBytes, zeroize } from './keys';
 import { formatZats, parseZecAmount } from './units';
 import { classifyAddress, parseZip321 } from './zip321';
+import { VaultError, type Vault, type VaultErrorCode } from './vault';
 
 export type Screen = 'booting' | 'welcome' | 'wallet' | 'settings' | 'storage-busy';
 
@@ -40,8 +41,9 @@ export interface CreateSession {
 
 export type RestoreBirthday = 'fullScan' | { readonly kind: 'height'; readonly height: number };
 
-/** App-level result codes: engine codes plus the onboarding gate refusal. */
-export type ImportErrorCode = EngineErrorCode | 'GATE_PENDING';
+/** App-level result codes: engine codes plus the onboarding gate refusal
+ * and the vault's wrong-passphrase / missing-envelope refusals. */
+export type ImportErrorCode = EngineErrorCode | 'GATE_PENDING' | VaultErrorCode;
 
 export interface ImportResult {
   readonly ok: boolean;
@@ -51,7 +53,15 @@ export interface ImportResult {
 
 export interface SpendGuard {
   readonly ok: boolean;
-  readonly reason?: 'view-only' | 'unavailable';
+  readonly reason?: 'view-only' | 'unavailable' | 'locked';
+}
+
+/** Onboarding custody choice (ADR-0002, issue #6): at create/restore the user
+ * picks "Remember on this device (encrypted)" or "Never store". `vaultPassphrase`
+ * is required when `remember` is true (the AES-GCM envelope key). */
+export interface RememberChoice {
+  readonly remember: boolean;
+  readonly vaultPassphrase?: string;
 }
 
 export interface SendDraftView {
@@ -77,6 +87,7 @@ export type SendNotice =
         | 'network-mismatch'
         | 'unavailable'
         | 'view-only'
+        | 'locked'
         | 'phrase';
     }
   | { readonly kind: 'engine'; readonly code: EngineErrorCode; readonly recovery: EngineRecovery };
@@ -109,8 +120,17 @@ export interface WalletApp {
   readonly pendingCount: ReadableAtom<number>;
   /** Startup recovery finished (boot gate): payment paths unlock after. */
   readonly recovered: ReadableAtom<boolean>;
-  /** Spend-capable = spend authority exists AND recovery completed (#4). */
+  /** Spend-capable = seed Wallet AND unlocked AND recovery completed (#4, #6). */
   readonly canSpend: ReadableAtom<boolean>;
+  /** True when the open Wallet's signer is attached (Unlock or mirror restore). */
+  readonly unlocked: ReadableAtom<boolean>;
+  /** Epoch ms when the idle deadline expires; null when not unlocked (#6). */
+  readonly unlockDeadline: ReadableAtom<number | null>;
+  /** Ms remaining until auto-Lock; null when not unlocked (countdown chip). */
+  readonly autoLockInMs: ReadableAtom<number | null>;
+  /** True when a Vault envelope exists for the open Wallet (Remember). False
+   * for view-only and Never-store Wallets — Unlock uses the phrase path. */
+  readonly hasVault: ReadableAtom<boolean>;
   /** Forced backup gate is open: a generated phrase awaits confirmation.
    * While true, every other onboarding path is refused (#4: not dismissable). */
   readonly backupPending: ReadableAtom<boolean>;
@@ -130,7 +150,7 @@ export interface WalletApp {
   readonly creating: ReadableAtom<boolean>;
   readonly onCreate: {
     generate(): Promise<CreateSession>;
-    confirmBackup(phrase: string): Promise<ImportResult>;
+    confirmBackup(phrase: string, choice?: RememberChoice): Promise<ImportResult>;
     /** Retry account creation on the wallet already on screen. */
     resume(): Promise<ImportResult>;
   };
@@ -141,13 +161,24 @@ export interface WalletApp {
       accountIndex: number;
       birthday: RestoreBirthday;
       name?: string;
+      custody?: RememberChoice;
     }): Promise<ImportResult>;
   };
   readonly onViewOnly: {
     import(args: { viewingKey: string; birthday: RestoreBirthday; name?: string }): Promise<ImportResult>;
   };
-  /** Capability gate the Send surface must pass before composing (#4). */
+  /** Capability gate the Send surface must pass before composing (#4, #6). */
   guardSpend(): SpendGuard;
+  /** Unlock the open Wallet from the Vault (Remember) or by re-entering the
+   * phrase (Never-store). On success, the signer is attached and the seed
+   * mirror + idle deadline persist (Remember only). Never auto-decrypts. */
+  unlock(passphrase: string): Promise<ImportResult>;
+  /** App-wide Lock (#6): detach the signer, zeroize the mirror, set the Lock
+   * flag. Viewing continues; both Networks and every open Wallet lose spend
+   * authority. The flag survives reload until the next Unlock clears it. */
+  lock(): Promise<void>;
+  /** Re-enter the recovery phrase (Never-store path; no Vault envelope). */
+  unlockWithPhrase(phrase: string): Promise<ImportResult>;
   readonly send: ReadableAtom<SendView>;
   readonly onSend: {
     open(): void;
@@ -171,6 +202,8 @@ export interface WalletApp {
 export interface WalletAppDeps {
   readonly engine: Engine;
   readonly registry: Registry;
+  /** App-level seed Vault (ADR-0002, issue #6). */
+  readonly vault: Vault;
   readonly endpoints: EndpointSettings;
   /** navigator.storage.persist() — OPFS eviction guard, requested at creation. */
   requestPersist(): Promise<boolean>;
@@ -229,21 +262,39 @@ const writeNetworkPref = (id: NetworkId): void => {
 
 const PENDING_SEED_KEY = 'yaw-pending-seed';
 
-const savePendingSeed = (id: string, phrase: string): void => {
+// The custody choice rides with the phrase: a reload mid-create must resume
+// as Remember (store envelope + mirror) or as Never-store, never silently
+// degrade. The vault passphrase sits in sessionStorage right next to the
+// seed phrase itself — same tab, same lifetime, no new exposure surface.
+interface PendingSeed {
+  readonly id: string;
+  readonly phrase: string;
+  readonly remember?: boolean;
+  readonly vaultPassphrase?: string;
+}
+
+const savePendingSeed = (choice: RememberChoice, seed: { id: string; phrase: string }): void => {
   try {
-    globalThis.sessionStorage?.setItem(PENDING_SEED_KEY, JSON.stringify({ id, phrase }));
+    globalThis.sessionStorage?.setItem(
+      PENDING_SEED_KEY,
+      JSON.stringify({ ...seed, ...(choice.remember && choice.vaultPassphrase !== undefined ? { remember: true, vaultPassphrase: choice.vaultPassphrase } : {}) }),
+    );
   } catch {
     // Reload can only finish creation when the tab can hold the phrase.
   }
 };
 
-const readPendingSeed = (): { id: string; phrase: string } | null => {
+const readPendingSeed = (): PendingSeed | null => {
   try {
     const raw = globalThis.sessionStorage?.getItem(PENDING_SEED_KEY);
     if (raw === undefined || raw === null || raw === '') return null;
-    const parsed = JSON.parse(raw) as { id?: unknown; phrase?: unknown };
+    const parsed = JSON.parse(raw) as { id?: unknown; phrase?: unknown; remember?: unknown; vaultPassphrase?: unknown };
     if (typeof parsed.id !== 'string' || typeof parsed.phrase !== 'string') return null;
-    return { id: parsed.id, phrase: parsed.phrase };
+    return {
+      id: parsed.id,
+      phrase: parsed.phrase,
+      ...(parsed.remember === true && typeof parsed.vaultPassphrase === 'string' ? { remember: true, vaultPassphrase: parsed.vaultPassphrase } : {}),
+    };
   } catch {
     return null;
   }
@@ -252,6 +303,79 @@ const readPendingSeed = (): { id: string; phrase: string } | null => {
 const clearPendingSeed = (): void => {
   try {
     globalThis.sessionStorage?.removeItem(PENDING_SEED_KEY);
+  } catch {
+    // already gone
+  }
+};
+
+// --- Session/Lock model (ADR-0002, issue #6) -------------------------------
+// The decrypted seed mirror lives in sessionStorage with a persisted idle
+// deadline. Unlock survives iff deadline-unexpired AND no Lock flag — checked
+// every boot, the ONLY guarantee. Browser session-restore may resurrect the
+// mirror, so process death is never a security boundary. The Lock flag is
+// app-wide (every open Wallet, both Networks) and survives reload until the
+// next Unlock clears it. Never auto-decrypt at startup: a valid mirror only
+// re-attaches the signer from already-decrypted bytes.
+
+const AUTO_LOCK_MS = 10 * 60 * 1000; // 10 activity-idle minutes (issue #6)
+const MIRROR_KEY = 'yaw-seed-mirror';
+const LOCK_FLAG_KEY = 'yaw-lock';
+
+interface SeedMirror {
+  readonly id: string;
+  readonly phrase: string;
+  /** Epoch ms when the idle deadline expires. */
+  readonly deadline: number;
+}
+
+const readMirror = (): SeedMirror | null => {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(MIRROR_KEY);
+    if (raw === undefined || raw === null || raw === '') return null;
+    const parsed = JSON.parse(raw) as Partial<SeedMirror>;
+    if (typeof parsed.id !== 'string' || typeof parsed.phrase !== 'string' || typeof parsed.deadline !== 'number')
+      return null;
+    return { id: parsed.id, phrase: parsed.phrase, deadline: parsed.deadline };
+  } catch {
+    return null;
+  }
+};
+
+const writeMirror = (m: SeedMirror): void => {
+  try {
+    globalThis.sessionStorage?.setItem(MIRROR_KEY, JSON.stringify(m));
+  } catch {
+    // Private mode can reject storage; the unlock still works for this tab.
+  }
+};
+
+const clearMirror = (): void => {
+  try {
+    globalThis.sessionStorage?.removeItem(MIRROR_KEY);
+  } catch {
+    // already gone
+  }
+};
+
+const readLockFlag = (): boolean => {
+  try {
+    return globalThis.localStorage?.getItem(LOCK_FLAG_KEY) === '1';
+  } catch {
+    return false;
+  }
+};
+
+const setLockFlag = (): void => {
+  try {
+    globalThis.localStorage?.setItem(LOCK_FLAG_KEY, '1');
+  } catch {
+    // private mode: the in-memory unlocked=false is the boundary here
+  }
+};
+
+const clearLockFlag = (): void => {
+  try {
+    globalThis.localStorage?.removeItem(LOCK_FLAG_KEY);
   } catch {
     // already gone
   }
@@ -282,6 +406,13 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const bootError = atom<string | null>(null);
   const send = atom<SendView>({ phase: 'closed' });
 
+  // --- Session/Lock atoms (issue #6) --------------------------------------
+  const unlocked = atom<boolean>(false);
+  const unlockDeadline = atom<number | null>(null);
+  const hasVault = atom<boolean>(false);
+  /** Ms remaining until auto-Lock; recomputed every tick (countdown chip). */
+  const autoLockInMs = atom<number | null>(null);
+
   const traceSecret = deps.traceSecret ?? (() => undefined);
 
   let wallet: EngineWallet | null = null;
@@ -290,6 +421,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   let openSeq = 0;
   let createPhrase: string | null = null;
   let backupConfirmed = false;
+  /** Custody choice awaiting the create's success (issue #6). Survives a
+   * SYNC_REQUIRED retry and the continue-after-tip path so the vault store +
+   * mirror happen exactly once, when the account lands. */
+  let pendingChoice: RememberChoice | null = null;
   /** Client whose sync stream is already subscribed. */
   let syncArmed: EngineWallet | null = null;
   /** Id of a create that is on screen but not registered yet. */
@@ -307,10 +442,15 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     bootError.set(null);
     held = null;
     send.set({ phase: 'closed' });
+    unlocked.set(false);
+    unlockDeadline.set(null);
+    autoLockInMs.set(null);
+    hasVault.set(false);
   };
 
   const closeWallet = async (): Promise<void> => {
     openSeq += 1; // invalidate in-flight opens and watch loops
+    stopAutoLock();
     const op = held?.operationId ?? null;
     held = null;
     send.set({ phase: 'closed' });
@@ -375,6 +515,51 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     }
   };
 
+  // --- Auto-Lock timer (issue #6) -----------------------------------------
+  // 10 activity-idle minutes. Send attempts count as activity; watching sync
+  // does NOT (the spec is explicit). The countdown chip reads autoLockInMs.
+  let autoLockTimer: ReturnType<typeof setInterval> | null = null;
+  let autoLockSeq = 0;
+
+  /** Reset the idle deadline to now + AUTO_LOCK_MS. Called on Unlock and on
+   * every send attempt (review/confirm). Sync ticks deliberately do not call
+   * this. The boot rule reads the PERSISTED deadline, so an activity bump
+   * rewrites the mirror too — otherwise a reload would lock a session the
+   * spec says activity extended. */
+  const touchIdle = (): void => {
+    if (!unlocked.get()) return;
+    const deadline = Date.now() + AUTO_LOCK_MS;
+    unlockDeadline.set(deadline);
+    autoLockInMs.set(AUTO_LOCK_MS);
+    const mirror = readMirror();
+    const info = walletInfo.get();
+    if (mirror !== null && info !== null && mirror.id === info.id) {
+      writeMirror({ ...mirror, deadline });
+    }
+  };
+
+  const stopAutoLock = (): void => {
+    autoLockSeq += 1; // invalidate any in-flight tick
+    if (autoLockTimer !== null) {
+      clearInterval(autoLockTimer);
+      autoLockTimer = null;
+    }
+  };
+
+  const startAutoLock = (): void => {
+    stopAutoLock();
+    if (!unlocked.get()) return;
+    const seq = autoLockSeq;
+    autoLockTimer = setInterval(() => {
+      if (seq !== autoLockSeq || !unlocked.get()) return;
+      const deadline = unlockDeadline.get();
+      if (deadline === null) return;
+      const remaining = deadline - Date.now();
+      autoLockInMs.set(remaining > 0 ? remaining : 0);
+      if (remaining <= 0) void lock();
+    }, 1000);
+  };
+
   /**
    * Finish opening a wallet whose Client is live: recovery is complete
    * (it ran inside open), serve balances from the LOCAL DB, then start sync.
@@ -388,7 +573,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       fingerprint: record.fingerprint,
       kind: record.kind,
     });
-    canSpend.set(record.kind === 'seed');
+    canSpend.set(false); // set below after the session check decides unlocked
     const account = await defaultAccount(w);
     if (account !== undefined) {
       birthday.set(account.birthdayHeight);
@@ -418,6 +603,11 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     }
     await deps.registry.touch(record.id);
     screen.set('wallet');
+    // Session/Lock boot check (issue #6): the ONLY unlock guarantee. A valid
+    // mirror re-attaches the signer from already-decrypted bytes (NOT a
+    // decrypt — the mirror is plaintext in sessionStorage). A Lock flag or an
+    // expired deadline forces a passphrase prompt. View-only has no machinery.
+    await restoreSession(w, record);
     await resumeStoredSeed(w, record);
   };
 
@@ -542,6 +732,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       await restore(true); // storage intact (e.g. lease held elsewhere): row back, reopen
       return asResult(e);
     }
+    // Vault envelope for this Wallet is gone too (issue #6): nothing of the
+    // user's seed survives Forget. Already-gone is success.
+    await deps.vault.remove(info.id).catch(() => undefined);
     resetStores();
     screen.set('welcome');
     return { ok: true };
@@ -658,7 +851,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     const phrase = createPhrase;
     const bytes = phraseBytes(phrase);
     traceSecret(bytes);
-    void createSeedWallet(bytes, false, phrase).finally(() => zeroize(bytes));
+    void createSeedWallet(bytes, false, phrase, pendingChoice).finally(() => zeroize(bytes));
   };
 
   /**
@@ -675,16 +868,196 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     createPhrase = pending.phrase;
     backupConfirmed = false;
     backupPending.set(true);
+    // A reload-resume honors the stored custody choice (Remember → store the
+    // envelope + mirror; Never-store → no mirror). A pendingChoice from the
+    // same in-memory session wins; otherwise the persisted one does. The
+    // envelope re-store is idempotent.
+    const storedChoice: RememberChoice | null =
+      pending.remember === true && pending.vaultPassphrase !== undefined
+        ? { remember: true, vaultPassphrase: pending.vaultPassphrase }
+        : null;
+    const choice: RememberChoice = pendingChoice ?? storedChoice ?? { remember: await deps.vault.has(record.id) };
     const bytes = phraseBytes(pending.phrase);
     traceSecret(bytes);
     try {
-      await createSeedWallet(bytes, false, pending.phrase);
+      await createSeedWallet(bytes, false, pending.phrase, choice);
     } finally {
       zeroize(bytes);
     }
   };
 
-  const createSeedWallet = async (bytes: Uint8Array, restartSync = false, phrase = ''): Promise<ImportResult> => {
+  // --- Session restore + Unlock/Lock (issue #6) ----------------------------
+  /** Boot-time unlock check: the ONLY guarantee. A valid mirror re-attaches
+   * the signer from already-decrypted bytes; a Lock flag or expired deadline
+   * leaves the Wallet locked (passphrase or phrase path required). */
+  const restoreSession = async (w: EngineWallet, record: WalletRecord): Promise<void> => {
+    stopAutoLock();
+    unlocked.set(false);
+    unlockDeadline.set(null);
+    autoLockInMs.set(null);
+    hasVault.set(false);
+    if (record.kind !== 'seed') return; // view-only: no Unlock machinery
+    hasVault.set(await deps.vault.has(record.id));
+    const locked = readLockFlag();
+    const mirror = readMirror();
+    const now = Date.now();
+    if (mirror !== null && mirror.id === record.id && mirror.deadline <= now) {
+      // An expired mirror is stale plaintext with no future use: remove it
+      // rather than leaving the seed readable in a locked session.
+      clearMirror();
+    }
+    if (mirror !== null && mirror.id === record.id && mirror.deadline > now && !locked) {
+      const account = await defaultAccount(w);
+      if (account === undefined) return;
+      const bytes = phraseBytes(mirror.phrase);
+      traceSecret(bytes);
+      try {
+        await w.attachSigner({ accountId: account.id, mnemonic: bytes });
+        unlocked.set(true);
+        unlockDeadline.set(mirror.deadline);
+        autoLockInMs.set(mirror.deadline - now);
+        startAutoLock();
+      } catch {
+        // A mirror that fails to attach is no longer trustworthy: drop it so
+        // the user is prompted for a passphrase rather than retrying bad bytes.
+        clearMirror();
+      } finally {
+        zeroize(bytes);
+      }
+    }
+    canSpend.set(record.kind === 'seed' && unlocked.get() && recovered.get());
+  };
+
+  /** App-wide Lock (issue #6): detach the signer, zeroize the mirror, set the
+   * Lock flag. Viewing continues. The flag survives reload until the next Unlock. */
+  const lock = async (): Promise<void> => {
+    stopAutoLock();
+    const w = wallet;
+    const info = walletInfo.get();
+    if (w !== null && info?.kind === 'seed') {
+      const account = await defaultAccount(w);
+      if (account !== undefined) {
+        try {
+          await w.detachSigner({ accountId: account.id });
+        } catch {
+          // best-effort detach; the flag + cleared mirror are the guarantee
+        }
+      }
+    }
+    clearMirror();
+    setLockFlag();
+    unlocked.set(false);
+    unlockDeadline.set(null);
+    autoLockInMs.set(null);
+    canSpend.set(false);
+  };
+
+  /** Shared Unlock guard: an open seed Wallet plus its default account, or
+   * null. All three Unlock paths (Vault passphrase, Never-store phrase,
+   * after create/restore) open with the same check. */
+  const unlockTarget = async (): Promise<{ w: EngineWallet; info: WalletInfo; account: EngineAccount } | null> => {
+    const w = wallet;
+    const info = walletInfo.get();
+    if (w === null || info === null || info.kind !== 'seed') return null;
+    const account = await defaultAccount(w);
+    if (account === undefined) return null;
+    return { w, info, account };
+  };
+
+  /** Shared Unlock success: clear the Lock flag, open the session against a
+   * fresh idle deadline, and restart the auto-Lock timer. `mirrorPhrase`
+   * (Remember custody only) persists the seed mirror; Never-store just sets
+   * the deadline, so a reload re-prompts. */
+  const markUnlocked = (id: string, mirrorPhrase: string | null): void => {
+    clearLockFlag();
+    unlocked.set(true);
+    const deadline = Date.now() + AUTO_LOCK_MS;
+    if (mirrorPhrase !== null) writeMirror({ id, phrase: mirrorPhrase, deadline });
+    unlockDeadline.set(deadline);
+    autoLockInMs.set(AUTO_LOCK_MS);
+    canSpend.set(true);
+    startAutoLock();
+  };
+
+  /** Unlock via the Vault passphrase (Remember path). Decrypts the envelope,
+   * verifies the phrase by attaching the signer (the SDK checks it against
+   * the stored viewing key), mirrors the seed, and clears the Lock flag. */
+  const unlock = async (passphrase: string): Promise<ImportResult> => {
+    const target = await unlockTarget();
+    if (target === null) return { ok: false, code: 'UNKNOWN', message: 'no open seed Wallet' };
+    const { w, info, account } = target;
+    let phrase: string;
+    try {
+      phrase = await deps.vault.load(info.id, passphrase);
+    } catch (e) {
+      const code: VaultErrorCode = e instanceof VaultError ? e.code : 'UNKNOWN';
+      return { ok: false, code, message: e instanceof Error ? e.message : String(e) };
+    }
+    const bytes = phraseBytes(phrase);
+    traceSecret(bytes);
+    try {
+      await w.attachSigner({ accountId: account.id, mnemonic: bytes });
+      markUnlocked(info.id, phrase);
+      return { ok: true };
+    } catch (e) {
+      return asResult(e);
+    } finally {
+      zeroize(bytes);
+    }
+  };
+
+  /** Unlock by re-entering the recovery phrase (Never-store path; no Vault
+   * envelope). Verifies via attachSigner; no mirror is written. */
+  const unlockWithPhrase = async (phrase: string): Promise<ImportResult> => {
+    const target = await unlockTarget();
+    if (target === null) return { ok: false, code: 'UNKNOWN', message: 'no open seed Wallet' };
+    const { w, account } = target;
+    let normalized: string;
+    try {
+      normalized = normalizePhrase(phrase);
+    } catch (e) {
+      return { ok: false, code: 'INVALID_MNEMONIC', message: e instanceof Error ? e.message : String(e) };
+    }
+    const bytes = phraseBytes(normalized);
+    traceSecret(bytes);
+    try {
+      await w.attachSigner({ accountId: account.id, mnemonic: bytes });
+      markUnlocked(target.info.id, null);
+      return { ok: true };
+    } catch (e) {
+      return asResult(e);
+    } finally {
+      zeroize(bytes);
+    }
+  };
+
+  /** Attach the signer using the phrase still in memory from a create/restore
+   * flow, then (Remember) store in vault + mirror, or (Never-store) set the
+   * idle deadline only. NOT auto-decrypt — the phrase is in memory from the
+   * user's own create/restore action this turn. */
+  const unlockAfterCreate = async (phrase: string, choice: RememberChoice | null): Promise<void> => {
+    const target = await unlockTarget();
+    if (target === null) return;
+    const { w, info, account } = target;
+    const bytes = phraseBytes(phrase);
+    traceSecret(bytes);
+    try {
+      await w.attachSigner({ accountId: account.id, mnemonic: bytes });
+      const remember = choice !== null && choice.remember && choice.vaultPassphrase !== undefined && choice.vaultPassphrase !== '';
+      if (remember && choice !== null && choice.vaultPassphrase !== undefined) {
+        await deps.vault.store(info.id, phrase, choice.vaultPassphrase);
+      }
+      hasVault.set(remember);
+      markUnlocked(info.id, remember ? phrase : null);
+    } catch {
+      // best-effort: a failed attach after create leaves the wallet locked;
+      // the user can Unlock with the passphrase (Remember) or phrase (Never).
+    } finally {
+      zeroize(bytes);
+    }
+  };
+
+  const createSeedWallet = async (bytes: Uint8Array, restartSync = false, phrase = '', choice: RememberChoice | null = null): Promise<ImportResult> => {
     const net = network.get();
     const seq = openSeq;
     let w: EngineWallet | null = wallet;
@@ -712,7 +1085,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         kind: 'seed',
         lastUsed: Date.now(),
       });
-      if (phrase !== '') savePendingSeed(id, phrase);
+      if (phrase !== '') savePendingSeed(choice ?? pendingChoice ?? { remember: false }, { id, phrase });
       // A network switch that landed while open() was in flight owns the screen.
       const ownsScreen = seq === openSeq && (wallet === null || wallet === w);
       if (ownsScreen) {
@@ -754,8 +1127,15 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       } else {
         await finishOpen(w, record, true);
       }
+      // Unlock-after-create (issue #6): the phrase is in memory from the flow,
+      // so attach the signer now (NOT auto-decrypt — this is the create itself).
+      // Remember → store in vault + mirror; Never-store → session-only, no mirror.
+      if (phrase !== '' && wallet === w) {
+        await unlockAfterCreate(phrase, choice ?? pendingChoice);
+      }
       backupConfirmed = true;
       createPhrase = null;
+      pendingChoice = null;
       pendingWalletId = null;
       backupPending.set(false);
       return { ok: true };
@@ -808,9 +1188,11 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
      * creates + registers + opens the Wallet. The main page appears as soon
      * as the phrase is accepted, with a zero balance and live sync progress.
      */
-    async confirmBackup(phrase: string): Promise<ImportResult> {
+    async confirmBackup(phrase: string, choice?: RememberChoice): Promise<ImportResult> {
       if (backupConfirmed) return { ok: true }; // idempotent double-tap
       if (createPhrase === null) return { ok: false, code: 'UNKNOWN', message: 'no phrase in flight' };
+      if (choice?.remember === true && (choice.vaultPassphrase === undefined || choice.vaultPassphrase === ''))
+        return { ok: false, code: 'INVALID_ARGUMENT', message: 'Remember on this device requires a passphrase' };
       let normalized: string;
       try {
         normalized = normalizePhrase(phrase);
@@ -820,10 +1202,11 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       if (normalized !== createPhrase) {
         return { ok: false, code: 'INVALID_MNEMONIC', message: 'phrase mismatch' };
       }
+      pendingChoice = choice ?? { remember: false };
       const bytes = phraseBytes(normalized);
       traceSecret(bytes);
       try {
-        return await createSeedWallet(bytes, false, normalized);
+        return await createSeedWallet(bytes, false, normalized, pendingChoice);
       } finally {
         zeroize(bytes);
       }
@@ -834,7 +1217,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       const bytes = phraseBytes(createPhrase);
       traceSecret(bytes);
       try {
-        return await createSeedWallet(bytes, true, createPhrase);
+        return await createSeedWallet(bytes, true, createPhrase, pendingChoice);
       } finally {
         zeroize(bytes);
       }
@@ -848,6 +1231,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       accountIndex: number;
       birthday: RestoreBirthday;
       name?: string;
+      custody?: RememberChoice;
     }): Promise<ImportResult> {
       // #4: a pending forced-backup gate blocks every other onboarding path.
       if (backupPending.get())
@@ -856,6 +1240,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Account index must be a whole number ≥ 0' };
       if (!validBirthday(args.birthday))
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Birthday height must be a whole number ≥ 1' };
+      if (args.custody?.remember === true && (args.custody.vaultPassphrase === undefined || args.custody.vaultPassphrase === ''))
+        return { ok: false, code: 'INVALID_ARGUMENT', message: 'Remember on this device requires a passphrase' };
       let phrase: string;
       try {
         phrase = normalizePhrase(args.phrase);
@@ -863,12 +1249,13 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         return { ok: false, code: 'INVALID_MNEMONIC', message: e instanceof Error ? e.message : String(e) };
       }
       const name = args.name ?? 'restored';
+      const choice: RememberChoice = args.custody ?? { remember: false };
       const bytes = phraseBytes(phrase);
       const pass = args.passphrase === undefined || args.passphrase === '' ? undefined : phraseBytes(args.passphrase);
       traceSecret(bytes);
       if (pass !== undefined) traceSecret(pass);
       try {
-        return await createWalletFlow({
+        const result = await createWalletFlow({
           name,
           kind: 'seed',
           run: async (w) => {
@@ -886,6 +1273,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
             return ufvk;
           },
         });
+        // Unlock-after-restore (issue #6): same path as create. The phrase is
+        // in memory from the restore action; attach + (Remember) vault + mirror.
+        if (result.ok && wallet !== null) {
+          await unlockAfterCreate(phrase, choice);
+        }
+        return result;
       } finally {
         zeroize(bytes);
         if (pass !== undefined) zeroize(pass);
@@ -975,6 +1368,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (info === null) return { ok: false, reason: 'unavailable' };
     if (info.kind !== 'seed') return { ok: false, reason: 'view-only' };
     if (!recovered.get()) return { ok: false, reason: 'unavailable' };
+    if (!unlocked.get()) return { ok: false, reason: 'locked' };
     return { ok: true };
   };
 
@@ -1098,9 +1492,11 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       const draft = readDraft(view);
       const guard = spendGuard();
       if (!guard.ok) {
-        showForm(draft, { kind: guard.reason === 'view-only' ? 'view-only' : 'unavailable' });
+        showForm(draft, { kind: guard.reason === 'view-only' ? 'view-only' : guard.reason === 'locked' ? 'locked' : 'unavailable' });
         return;
       }
+      // A send attempt counts as activity (issue #6): reset the idle deadline.
+      touchIdle();
       const resolved = resolveDraft(draft);
       if (!resolved.ok) {
         if (view.phase === 'review') void releaseHeld();
@@ -1136,6 +1532,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       const view = send.get();
       if (view.phase !== 'review' || held === null || wallet === null) return;
       const draft = readDraft(view);
+      // Broadcasting is a spend attempt → activity (issue #6).
+      touchIdle();
       try {
         const result = await wallet.send(held.proposalId);
         held = null;
@@ -1165,6 +1563,17 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           return;
         }
         await wallet.attachSigner({ accountId: account.id, mnemonic: bytes });
+        // The send-path unlock is the Never-store path (no Vault envelope) or
+        // a Remember Wallet whose mirror expired: enter the session model so
+        // auto-Lock and canSpend track this attach (issue #6). No mirror is
+        // written here — the Vault path writes one via app.unlock().
+        clearLockFlag();
+        unlocked.set(true);
+        unlockDeadline.set(Date.now() + AUTO_LOCK_MS);
+        autoLockInMs.set(AUTO_LOCK_MS);
+        canSpend.set(true);
+        startAutoLock();
+        touchIdle();
         if (held !== null) send.set({ phase: 'review', draft: draftView(draft), proposal: held, notice: null });
         else showForm(draft, null);
       } catch (error) {
@@ -1199,6 +1608,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     pendingCount,
     recovered,
     canSpend,
+    unlocked,
+    unlockDeadline,
+    autoLockInMs,
+    hasVault,
     backupPending,
     creating,
     bootError,
@@ -1211,6 +1624,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     onRestore,
     onViewOnly,
     guardSpend: spendGuard,
+    unlock,
+    lock,
+    unlockWithPhrase,
     send,
     onSend,
     async history(): Promise<readonly EngineHistoryEntry[]> {

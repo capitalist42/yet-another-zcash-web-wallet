@@ -108,6 +108,24 @@ input[type='checkbox'] {
   width: auto;
   display: inline;
 }
+input[type='radio'] {
+  width: auto;
+  display: inline;
+  margin: 0;
+}
+/* The nested passphrase fields keep the default stacked block layout; only
+   the radio rows sit inline (issue #6). */
+.custody label:has(input[type='radio']) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.custody {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 12px 0;
+  padding: 4px 12px 12px;
+}
 .balances {
   list-style: none;
   padding: 0;

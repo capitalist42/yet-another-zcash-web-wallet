@@ -3,6 +3,7 @@
 import { createWalletApp, type WalletApp } from '../wallet/app';
 import { createAdapterEngine } from '../wallet/engine/adapter';
 import { createRegistry, idbRegistryStore } from '../wallet/registry';
+import { createVault, idbVaultStore } from '../wallet/vault';
 import { DEFAULT_ENDPOINTS } from '../wallet/policy';
 
 let instance: WalletApp | null = null;
@@ -12,6 +13,7 @@ export const getApp = (): WalletApp => {
     instance = createWalletApp({
       engine: createAdapterEngine(),
       registry: createRegistry(idbRegistryStore()),
+      vault: createVault(idbVaultStore()),
       endpoints: DEFAULT_ENDPOINTS,
       // OPFS eviction guard, requested at Wallet creation (issue #3).
       requestPersist: async () => (await navigator.storage?.persist?.()) === true,

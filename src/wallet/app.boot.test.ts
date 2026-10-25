@@ -9,6 +9,7 @@ import { createFakeEngine, type FakeEngine } from './engine/fake';
 import { createWalletApp, type WalletApp } from './app';
 import { DEFAULT_ENDPOINTS } from './policy';
 import { overallProgress } from './sync-progress';
+import { createVault, idbVaultStore } from './vault';
 
 // A valid test vector phrase (all-zero entropy) for the restore race case.
 const FUNDED_PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -41,6 +42,7 @@ beforeEach(() => {
   app = createWalletApp({
     engine: engine.engine,
     registry,
+    vault: createVault(idbVaultStore()),
     endpoints: DEFAULT_ENDPOINTS,
     requestPersist: async () => true,
   });
@@ -125,6 +127,7 @@ describe('boot choreography', () => {
       const reloaded = createWalletApp({
         engine: engine.engine,
         registry,
+        vault: createVault(idbVaultStore()),
         endpoints: DEFAULT_ENDPOINTS,
         requestPersist: async () => true,
       });
@@ -187,7 +190,9 @@ describe('boot choreography', () => {
     expect(watchAt).toBeGreaterThan(balanceAt);
     expect(startSyncAt).toBeGreaterThan(watchAt);
     expect(app.recovered.get()).toBe(true);
-    expect(app.canSpend.get()).toBe(true);
+    // Issue #6: a seed Wallet boots LOCKED — spend authority lives only in
+    // the Vault + memory, and a fresh boot has neither until Unlock.
+    expect(app.canSpend.get()).toBe(false);
     expect(app.balances.get()?.sapling).toBe(5n);
   });
 
@@ -200,7 +205,9 @@ describe('boot choreography', () => {
     expect(app.guardSpend()).toEqual({ ok: false, reason: 'unavailable' });
     engine.pending().releaseOpen();
     await booted;
-    expect(app.guardSpend()).toEqual({ ok: true });
+    // Issue #6: recovery completion no longer grants spend — Unlock does.
+    // A seed Wallet with no mirror / expired deadline is locked on boot.
+    expect(app.guardSpend()).toEqual({ ok: false, reason: 'locked' });
   });
 
   it('sync progress flows from the watch stream into the store', async () => {
@@ -315,6 +322,7 @@ describe('boot choreography', () => {
     const a = createWalletApp({
       engine: engine.engine,
       registry: broken,
+      vault: createVault(idbVaultStore()),
       endpoints: DEFAULT_ENDPOINTS,
       requestPersist: async () => true,
     });
@@ -453,6 +461,7 @@ describe('boot choreography', () => {
       engine: engine.engine,
       registry: flaky,
       endpoints: DEFAULT_ENDPOINTS,
+      vault: createVault(idbVaultStore()),
       requestPersist: async () => true,
     });
     await a.boot();

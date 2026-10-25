@@ -38,6 +38,10 @@ export interface FakeAccountSpec {
   birthdayHeight?: number;
   accountIndex?: number | null;
   addresses?: string[];
+  /** SDK-model: the seed phrase this account was created/imported with, so
+   * attachSigner can reject a mismatched phrase like the real viewing-key
+   * check (issue #6). Absent for accounts injected via queueWallet. */
+  phrase?: string;
   balance?: Partial<Omit<EngineBalance, 'accountId' | 'scanned'>>;
   history?: EngineHistoryEntry[];
 }
@@ -137,6 +141,7 @@ export class FakeWallet implements EngineWallet {
   readonly sentProposalIds: string[] = [];
   readonly abandoned: string[] = [];
   readonly attachArgs: { accountId: string; mnemonic: Uint8Array }[] = [];
+  readonly detachArgs: { accountId: string }[] = [];
   private readonly specs = new Map<string, FakeAccountSpec>();
   private readonly proposalQueue: { proposal: EngineProposal; txid: string | null }[] = [];
   private readonly proposeFails: ScriptedFailure[] = [];
@@ -247,7 +252,11 @@ export class FakeWallet implements EngineWallet {
     this.check('createSeed');
     this.freshnessGate();
     this.assertPhrase(args.mnemonic);
-    return this.makeSeed(args.name ?? 'wallet', false, 0, 1);
+    const acct = this.makeSeed(args.name ?? 'wallet', false, 0, 1);
+    // Model the SDK: the account remembers its seed phrase, so attachSigner
+    // can reject a mismatched one like the real viewing-key check does (#6).
+    this.specs.get(acct.account.id)!.phrase = new TextDecoder().decode(args.mnemonic);
+    return acct;
   }
 
   async importSeed(args: {
@@ -261,7 +270,9 @@ export class FakeWallet implements EngineWallet {
     this.freshnessGate();
     this.assertPhrase(args.mnemonic);
     const height = args.birthday === 'fullScan' ? 1 : args.birthday.firstScanHeight;
-    return this.makeSeed(args.name ?? 'restored', false, args.accountIndex, height);
+    const acct = this.makeSeed(args.name ?? 'restored', false, args.accountIndex, height);
+    this.specs.get(acct.account.id)!.phrase = new TextDecoder().decode(args.mnemonic);
+    return acct;
   }
 
   /** Models the SDK precondition: stale local chain state rejects account
@@ -433,10 +444,25 @@ export class FakeWallet implements EngineWallet {
 
   async attachSigner(args: { accountId: string; mnemonic: Uint8Array }): Promise<void> {
     this.check('attachSigner');
-    this.attachArgs.push(args);
+    // Copy before storing, like the real SDK: callers zeroize the bytes they
+    // hand us (issue #6), so a captured reference would read all-zero later.
+    this.attachArgs.push({ ...args, mnemonic: args.mnemonic.slice() });
     this.assertPhrase(args.mnemonic);
     const spec = this.need(args.accountId);
+    // Viewing-key verification model (issue #6): a valid mnemonic that is not
+    // THE wallet's phrase must fail, exactly like the SDK's check of the
+    // restored key against the stored viewing key.
+    if (spec.phrase !== undefined && spec.phrase !== new TextDecoder().decode(args.mnemonic)) {
+      throw new EngineError('INVALID_MNEMONIC', 'phrase does not match this wallet');
+    }
     spec.signerAttached = true;
+  }
+
+  async detachSigner(args: { accountId: string }): Promise<void> {
+    this.check('detachSigner');
+    this.detachArgs.push(args);
+    const spec = this.need(args.accountId);
+    spec.signerAttached = false;
   }
 
   async close(): Promise<void> {
