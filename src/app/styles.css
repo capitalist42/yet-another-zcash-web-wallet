@@ -164,6 +164,10 @@ input[type='checkbox'] {
   height: 100%;
   background: var(--accent);
   width: 0;
+  transition: width 0.45s ease;
+}
+.sync-fill.failed {
+  background: var(--error);
 }
 .sync-fill.indeterminate {
   width: 35%;
@@ -172,6 +176,13 @@ input[type='checkbox'] {
 @keyframes sync-slide {
   0% { transform: translateX(-120%); }
   100% { transform: translateX(320%); }
+}
+/* Heights jump in whole blocks; steady digits stop the readout jittering. */
+.sync-pct {
+  font-variant-numeric: tabular-nums;
+}
+.sync-detail {
+  font-variant-numeric: tabular-nums;
 }
 
 .choices {

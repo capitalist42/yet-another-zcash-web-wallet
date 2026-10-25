@@ -1,7 +1,10 @@
 // The Wallet app service: boot choreography + onboarding flows + UI stores.
 // Everything engine-shaped goes through the port; this module is the single
 // orchestrator the React tree subscribes to (nanostores).
-import { atom, type ReadableAtom, type WritableAtom } from 'nanostores';
+import { atom, computed, type ReadableAtom, type WritableAtom } from 'nanostores';
+/** Sync status + the account's birthday = everything the progress bar needs. */
+export type SyncProgressView = EngineSyncStatus & { readonly birthday: number | null };
+
 import type {
   Engine,
   EngineAccount,
@@ -55,6 +58,8 @@ export interface WalletApp {
   readonly walletInfo: ReadableAtom<WalletInfo | null>;
   readonly balances: ReadableAtom<EngineBalance | null>;
   readonly sync: ReadableAtom<EngineSyncStatus | null>;
+  /** `sync` + the scanned account's birthday height (percent denominator). */
+  readonly syncProgress: ReadableAtom<SyncProgressView | null>;
   readonly address: ReadableAtom<string | null>;
   readonly pendingCount: ReadableAtom<number>;
   /** Startup recovery finished (boot gate): payment paths unlock after. */
@@ -118,6 +123,26 @@ const asResult = (e: unknown): ImportResult => {
 const validBirthday = (b: RestoreBirthday): boolean =>
   b === 'fullScan' || (Number.isInteger(b.height) && b.height >= 1);
 
+/** `getSyncStatus()` cadence for the in-flight progress bar (spike §Sync:
+ * the watch stream only publishes on scan-revision commits). */
+const SYNC_POLL_MS = 1_500;
+
+const delay = (ms: number): Promise<void> => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+};
+
+/** Sync-store equality: re-setting an identical snapshot every poll tick
+ * would wake every subscriber (progress bar, history refresh) for nothing. */
+const sameSync = (a: EngineSyncStatus | null, b: EngineSyncStatus): boolean =>
+  a !== null &&
+  a.activity === b.activity &&
+  a.scanned === b.scanned &&
+  a.target === b.target &&
+  a.targetReached === b.targetReached &&
+  a.scanComplete === b.scanComplete;
+
 const NETWORK_PREF_KEY = 'yaw-network';
 
 const readNetworkPref = (): NetworkId | null => {
@@ -180,6 +205,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const walletInfo = atom<WalletInfo | null>(null);
   const balances = atom<EngineBalance | null>(null);
   const sync = atom<EngineSyncStatus | null>(null);
+  /** Scanned account's first-scan height: the progress bar's lower bound. */
+  const birthday = atom<number | null>(null);
+  const syncProgress = computed([sync, birthday], (s, b) => (s === null ? null : { ...s, birthday: b }));
   const address = atom<string | null>(null);
   const pendingCount = atom<number>(0);
   const recovered = atom<boolean>(false);
@@ -203,6 +231,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     walletInfo.set(null);
     balances.set(null);
     sync.set(null);
+    birthday.set(null);
     address.set(null);
     pendingCount.set(0);
     recovered.set(false);
@@ -238,6 +267,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         await refreshOperations();
         const account = await defaultAccount(w);
         if (account !== undefined) {
+          birthday.set(account.birthdayHeight);
           const raw = await w.getBalance(account.id);
           const prev = balances.get();
           const unscanned = raw.transparent === null && raw.sapling === null && raw.ironwood === null;
@@ -248,6 +278,26 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       }
     } catch {
       // closed or superseded; the next open owns the stores now
+    }
+  };
+
+  /** `getSyncStatus()` answers while the scan runs; `watchSync` publishes only
+   * on scan-revision commits (spike §Sync), so without this poll the bar would
+   * sit at "—" for minutes on a long scan. Owns only the sync store: balances
+   * and operations stay on the watch stream. Stops at the tip; a failed read
+   * is not fatal (the next tick retries). */
+  const pollLoop = async (w: EngineWallet): Promise<void> => {
+    for (;;) {
+      if (wallet !== w || sync.get()?.targetReached === true) return;
+      try {
+        const status = await w.syncStatus();
+        if (wallet !== w) return;
+        if (!sameSync(sync.get(), status)) sync.set(status);
+        if (status.targetReached) continueCreateAfterTip();
+      } catch {
+        // transient engine read; retry on the next tick
+      }
+      await delay(SYNC_POLL_MS);
     }
   };
 
@@ -267,6 +317,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     canSpend.set(record.kind === 'seed');
     const account = await defaultAccount(w);
     if (account !== undefined) {
+      birthday.set(account.birthdayHeight);
       const raw = await w.getBalance(account.id);
       // A brand-new seed has no notes. Null pool fields mean "not scanned
       // yet", so the main page shows zero instead of an empty dash.
@@ -288,6 +339,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (syncArmed !== w) {
       syncArmed = w;
       void watchLoop(w);
+      void pollLoop(w);
       await w.startSync();
     }
     await deps.registry.touch(record.id);
@@ -461,6 +513,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (syncArmed !== w) {
       syncArmed = w;
       void watchLoop(w);
+      void pollLoop(w);
       await w.startSync();
       return;
     }
@@ -746,6 +799,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     walletInfo,
     balances,
     sync,
+    syncProgress,
     address,
     pendingCount,
     recovered,

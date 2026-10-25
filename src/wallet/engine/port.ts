@@ -136,6 +136,12 @@ export interface EngineWallet {
   getBalance(accountId: string): Promise<EngineBalance>;
   getHistory(accountId: string, limit?: number): Promise<readonly EngineHistoryEntry[]>;
   watchSync(): AsyncIterable<EngineSyncStatus>;
+  /**
+   * Snapshot of the current sync progress. Unlike the watchSync stream —
+   * which publishes only on scan-revision commits (spike §Sync) — this
+   * answers while a scan runs, so the progress bar can poll it.
+   */
+  syncStatus(): Promise<EngineSyncStatus>;
   startSync(): Promise<void>;
   /**
    * Bounded tip-freshness pass for mutation preconditions (accounts.create

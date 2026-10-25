@@ -6,6 +6,7 @@ import { getApp, startApp } from './wiring';
 import type { ImportResult, RestoreBirthday } from '../wallet/app';
 import type { EngineHistoryEntry, NetworkId } from '../wallet/engine/port';
 import { formatZats } from '../wallet/units';
+import { overallProgress } from '../wallet/sync-progress';
 
 const app = getApp();
 
@@ -51,34 +52,41 @@ const birthdayChoice = (fullScan: boolean, height: string): RestoreBirthday =>
   fullScan ? 'fullScan' : { kind: 'height', height: Number(height) };
 
 function SyncBar() {
-  const sync = useStore(app.sync);
-  if (sync === null) return <p className="muted">Sync: preparing…</p>;
-  const scanned = sync.scanned === null ? '—' : sync.scanned.toLocaleString('en-US');
-  const target = sync.target === null ? '—' : sync.target.toLocaleString('en-US');
-  const known = sync.scanned !== null && sync.target !== null && sync.target > 0;
-  const pct = known ? Math.min(100, Math.round((sync.scanned! / sync.target!) * 100)) : null;
-  const label = sync.targetReached ? 'Wallet synced' : sync.activity === 'failed' ? 'Sync failed' : 'Syncing wallet';
+  const view = useStore(app.syncProgress);
+  if (view === null) return <p className="muted">Sync: preparing…</p>;
+  const p = overallProgress(view, view.birthday);
+  const scanned = view.scanned === null ? '—' : view.scanned.toLocaleString('en-US');
+  const target = view.target === null ? '—' : view.target.toLocaleString('en-US');
+  const label = view.targetReached ? 'Wallet synced' : p.failed ? 'Sync failed' : 'Syncing wallet';
+  const pctText = p.percent === null ? '—' : `${p.percent}%`;
+  const valueText = p.done
+    ? 'up to date'
+    : p.percent === null
+      ? view.activity
+      : `${p.percent}% · ${p.remaining?.toLocaleString('en-US')} blocks to go`;
+  const fill = p.failed ? 'sync-fill failed' : p.percent === null && view.activity === 'running' ? 'sync-fill indeterminate' : 'sync-fill';
   return (
     <div className="sync" aria-label="sync">
       <div className="row">
         <span>{label}</span>
-        <span className="muted">{pct === null ? sync.activity : `${pct}%`}</span>
+        <span className="muted sync-pct">{pctText}</span>
       </div>
       <div
         className="sync-track"
         role="progressbar"
         aria-valuemin={0}
         aria-valuemax={100}
-        aria-valuenow={pct ?? undefined}
+        aria-valuenow={p.percent ?? undefined}
+        aria-valuetext={valueText}
       >
         <div
-          className={pct === null && sync.activity === 'running' ? 'sync-fill indeterminate' : 'sync-fill'}
-          style={pct === null ? undefined : { width: `${pct}%` }}
+          className={fill}
+          style={p.percent === null ? undefined : { width: `${p.percent}%` }}
         />
       </div>
-      <p className="muted">
+      <p className="muted sync-detail">
         scanned {scanned} / {target}
-        {sync.targetReached ? ' · up to date' : ''}
+        {p.done ? ' · up to date' : p.remaining !== null ? ` · ${p.remaining.toLocaleString('en-US')} blocks to go` : ''}
       </p>
     </div>
   );

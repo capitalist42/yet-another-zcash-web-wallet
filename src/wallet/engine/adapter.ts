@@ -282,6 +282,10 @@ class AdapterWallet implements EngineWallet {
     };
   }
 
+  async syncStatus(): Promise<EngineSyncStatus> {
+    return mapSync(await this.client.getSyncStatus());
+  }
+
   /** Fire-and-forget scan: sync() resolves at target, which can take minutes;
    * boot must not block on it. Failures surface via the sync stream/status. */
   async startSync(): Promise<void> {

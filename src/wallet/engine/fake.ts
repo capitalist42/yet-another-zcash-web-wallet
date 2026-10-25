@@ -151,6 +151,7 @@ export class FakeWallet implements EngineWallet {
   }
 
   pushSync(status: EngineSyncStatus): void {
+    this.lastStatus = status;
     for (const w of this.watchers) w.push(status);
   }
 
@@ -305,6 +306,18 @@ export class FakeWallet implements EngineWallet {
   async startSync(): Promise<void> {
     this.check('startSync');
     for (const status of this.syncQueue) this.pushSync(status);
+  }
+
+  /** Scriptable mid-scan snapshots: `polled` drains first, else the last
+   * status any watcher saw — a real getSyncStatus always answers. */
+  polled: EngineSyncStatus[] = [];
+  private lastStatus: EngineSyncStatus | null = null;
+  async syncStatus(): Promise<EngineSyncStatus> {
+    this.check('syncStatus');
+    const next = this.polled.shift();
+    if (next !== undefined) return next;
+    if (this.lastStatus !== null) return this.lastStatus;
+    throw new EngineError('UNKNOWN', 'no sync status available yet');
   }
 
   async syncFresh(_timeoutMs: number): Promise<void> {
