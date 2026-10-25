@@ -234,6 +234,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
 
   const boot = async (): Promise<void> => {
     screen.set('booting');
+    bootError.set(null); // a clean boot must not keep the previous failure on screen
     endpoint.set(deps.endpoints[network.get()]);
     try {
       const last = await deps.registry.lastUsed(network.get());

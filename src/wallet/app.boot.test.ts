@@ -233,4 +233,27 @@ describe('boot choreography', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ network: 'testnet', kind: 'seed' });
   });
+
+  it('a clean boot clears the previous bootError', async () => {
+    let fail = true;
+    const flaky: Registry = {
+      ...registry,
+      lastUsed: async (net) => {
+        if (fail) throw new Error('idb down');
+        return registry.lastUsed(net);
+      },
+    };
+    const a = createWalletApp({
+      engine: engine.engine,
+      registry: flaky,
+      endpoints: DEFAULT_ENDPOINTS,
+      requestPersist: async () => true,
+    });
+    await a.boot();
+    expect(a.bootError.get()).toBe('idb down');
+    fail = false;
+    await a.setNetwork('mainnet'); // a real switch boots again and must drop the old error
+    expect(a.screen.get()).toBe('welcome');
+    expect(a.bootError.get()).toBeNull();
+  });
 });
