@@ -50,6 +50,17 @@ function BirthdayFields(props: {
 const birthdayChoice = (fullScan: boolean, height: string): RestoreBirthday =>
   fullScan ? 'fullScan' : { kind: 'height', height: Number(height) };
 
+/** Active network indicator. Testnet gets the warn border so a devnet
+ * balance is never mistaken for mainnet money. */
+function NetworkChip() {
+  const network = useStore(app.network);
+  return (
+    <span className={network === 'testnet' ? 'chip warn' : 'chip'} data-testid="network-chip">
+      {network === 'testnet' ? 'Testnet' : 'Mainnet'}
+    </span>
+  );
+}
+
 function SyncBar() {
   const sync = useStore(app.sync);
   if (sync === null) return <p className="muted">Sync: preparing…</p>;
@@ -136,6 +147,7 @@ function WalletScreen() {
         <h1>
           {info.name}{info.fingerprint !== '' && <span className="chip">{info.fingerprint}</span>}
           {info.kind === 'viewonly' && <span className="chip">View-only</span>}
+          <NetworkChip />
           {/* ADR-0001: the endpoint operator is a party to your privacy. */}
           <span className="chip">{new URL(endpoint).host}</span>
         </h1>
@@ -360,7 +372,10 @@ function WelcomeScreen() {
   return (
     <section className="screen" aria-label="welcome">
       <header className="row">
-        <h1>Zcash Wallet</h1>
+        <h1>
+          Zcash Wallet
+          <NetworkChip />
+        </h1>
         <button type="button" className="secondary" onClick={() => app.openSettings()}>
           Settings
         </button>
@@ -402,7 +417,10 @@ function WelcomeScreen() {
 function SettingsScreen() {
   const network = useStore(app.network);
   const endpoint = useStore(app.endpoint);
+  const walletInfo = useStore(app.walletInfo);
   const [busy, setBusy] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
   const choose = async (next: NetworkId): Promise<void> => {
     if (next === network) {
       app.closeSettings();
@@ -411,6 +429,17 @@ function SettingsScreen() {
     setBusy(true);
     try {
       await app.setNetwork(next);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (): Promise<void> => {
+    setBusy(true);
+    setRemoveError(null);
+    try {
+      const res = await app.removeWallet();
+      if (!res.ok) setRemoveError(errorText(res, 'remove failed'));
+      setConfirmRemove(false);
     } finally {
       setBusy(false);
     }
@@ -450,6 +479,30 @@ function SettingsScreen() {
       <p className="muted">
         Lightwalletd <span className="chip">{new URL(endpoint).host}</span>
       </p>
+      {walletInfo !== null && (
+        <>
+          <h2>Remove Wallet</h2>
+          <p className="muted">
+            Erases “{walletInfo.name}” from this browser, including its transaction history. Funds are on
+            the chain: only your backup phrase can restore this Wallet.
+          </p>
+          {confirmRemove ? (
+            <div className="row">
+              <button type="button" className="danger" disabled={busy} onClick={() => void remove()}>
+                {busy ? 'Removing…' : 'Yes, erase this Wallet'}
+              </button>
+              <button type="button" className="secondary" disabled={busy} onClick={() => setConfirmRemove(false)}>
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button type="button" className="danger" disabled={busy} onClick={() => setConfirmRemove(true)}>
+              Remove Wallet
+            </button>
+          )}
+          {removeError !== null && <p className="error">{removeError}</p>}
+        </>
+      )}
     </section>
   );
 }

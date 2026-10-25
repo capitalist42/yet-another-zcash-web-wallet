@@ -71,6 +71,11 @@ button.secondary {
   color: var(--fg);
   border: 1px solid var(--border);
 }
+button.danger {
+  background: transparent;
+  color: var(--error);
+  border: 1px solid var(--error);
+}
 .tabs button {
   background: transparent;
   color: var(--fg);
