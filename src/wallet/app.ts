@@ -735,7 +735,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           continue;
         }
         const outputs = await w.listTransactionOutputs(entry.txid);
-        const complete = outputs.every((o) => o.address !== null && o.value !== null);
+        // Empty is unread, not classified: `[].every(...)` is vacuously true,
+        // and getTransaction is null until the local tx database catches up.
+        const complete = outputs.length > 0 && outputs.every((o) => o.address !== null && o.value !== null);
         let inboundHere = false;
         const credits: { address: string; value: bigint }[] = [];
         for (const o of outputs) {

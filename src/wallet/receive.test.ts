@@ -221,6 +221,45 @@ describe('Receive Address rotation (ADR-0004)', () => {
     expect(app.exposedAddresses.get()).toEqual([{ address: 'u1view1', receivedZats: 1_000n }]);
   });
 
+  it('a history entry whose wallet transaction is still missing stays unobserved and retries', async () => {
+    await registry.add(row({ id: 'a' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-1', addresses: ['u1a'] }] });
+    await app.boot();
+    const w = engine.lastWallet();
+
+    // Production unread shape: getHistory lists the txid, getTransaction is
+    // null, listTransactionOutputs answers []. `[].every` must not classify.
+    w.addTransaction('acct-1', entry('tx1'), [out('u1a', 1_000n)]);
+    w.missingTxs.add('tx1');
+    const atBoot = app.exposedAddresses.get();
+    w.pushSync(syncAt(10, 10, true));
+    await until(app.exposedAddresses, (v) => v !== atBoot);
+    expect(app.address.get()).toBe('u1a');
+    expect(mintsOf(w)).toBe(0);
+    expect(app.exposedAddresses.get()).toEqual([{ address: 'u1a', receivedZats: 0n }]);
+    expect(w.calls.filter((c) => c === 'listTransactionOutputs')).toHaveLength(1);
+
+    w.resolveTransactions('tx1');
+    const shown = app.exposedAddresses.get();
+    const settled = until(app.exposedAddresses, (v) => v !== shown);
+    w.pushSync(syncAt(11, 11, true));
+    await settled;
+    expect(app.address.get()).toBe('u1minted2-acct-1');
+    expect(mintsOf(w)).toBe(1);
+    expect(app.exposedAddresses.get()).toEqual([
+      { address: 'u1a', receivedZats: 1_000n },
+      { address: 'u1minted2-acct-1', receivedZats: 0n },
+    ]);
+    expect(w.calls.filter((c) => c === 'listTransactionOutputs').length).toBeGreaterThan(1);
+
+    const before = app.exposedAddresses.get();
+    const again = until(app.exposedAddresses, (v) => v !== before);
+    w.pushSync(syncAt(12, 12, true));
+    await again;
+    expect(mintsOf(w)).toBe(1);
+    expect(app.exposedAddresses.get()[0]?.receivedZats).toBe(1_000n);
+  });
+
   it('a tx readable only after enhancement still rotates exactly once when complete', async () => {
     await registry.add(row({ id: 'a' }));
     engine.queueWallet({ accounts: [{ id: 'acct-1', addresses: ['u1a'] }] });
