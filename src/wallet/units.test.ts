@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { fingerprintFromUfvk } from './fingerprint';
 import { frozenPolicy, RECOVERY_POLICY, storageName, DEFAULT_ENDPOINTS } from './policy';
+import { MAINNET_EXPLORER_PRESETS, MAINNET_LIGHTWALLETD_PRESETS, presetById, transactionUrl } from './endpoints';
 import { formatZats } from './units';
 import { generatePhrase, validatePhrase, phraseBytes, zeroize } from './keys';
 import { isNonTerminal } from './engine/port';
@@ -54,6 +55,34 @@ describe('endpoints', () => {
   it('defaults to the CORS-open gRPC-Web proxies', () => {
     expect(DEFAULT_ENDPOINTS.mainnet).toContain('zcash-mainnet.chainsafe.dev');
     expect(DEFAULT_ENDPOINTS.testnet).toContain('zcash-testnet.chainsafe.dev');
+  });
+  it('lists the public mainnet lightwalletd servers, with ChainSafe kept as the browser default', () => {
+    expect(MAINNET_LIGHTWALLETD_PRESETS[0]?.url).toBe(DEFAULT_ENDPOINTS.mainnet);
+    const urls = MAINNET_LIGHTWALLETD_PRESETS.map((preset) => preset.url);
+    expect(urls).toContain('https://mainnet.lightwalletd.com:9067');
+    for (let n = 1; n <= 8; n += 1) expect(urls).toContain(`https://lwd${n}.zcash-infra.com:9067`);
+  });
+  it('lists the public mainnet block explorers', () => {
+    expect(MAINNET_EXPLORER_PRESETS.map((preset) => preset.url)).toEqual([
+      'https://mainnet.zcashexplorer.app/',
+      'https://zcashblockexplorer.com/',
+      'https://blockchair.com/zcash',
+      'https://3xpl.com/zcash',
+    ]);
+  });
+  it('builds a transaction lookup on the selected explorer', () => {
+    const zcashExplorer = presetById(MAINNET_EXPLORER_PRESETS, 'zcashexplorer');
+    const blockExplorer = presetById(MAINNET_EXPLORER_PRESETS, 'zcashblockexplorer');
+    const blockchair = presetById(MAINNET_EXPLORER_PRESETS, 'blockchair');
+    const threeXpl = presetById(MAINNET_EXPLORER_PRESETS, '3xpl');
+    expect(zcashExplorer).not.toBeNull();
+    expect(blockExplorer).not.toBeNull();
+    expect(blockchair).not.toBeNull();
+    expect(threeXpl).not.toBeNull();
+    expect(transactionUrl(zcashExplorer!, 'abc')).toBe('https://mainnet.zcashexplorer.app/transactions/abc');
+    expect(transactionUrl(blockExplorer!, 'abc')).toBe('https://zcashblockexplorer.com/transactions/abc');
+    expect(transactionUrl(blockchair!, 'abc')).toBe('https://blockchair.com/zcash/transaction/abc');
+    expect(transactionUrl(threeXpl!, 'abc')).toBe('https://3xpl.com/zcash/transaction/abc');
   });
 });
 

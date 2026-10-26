@@ -11,6 +11,7 @@ import { MAX_SHIELD_ADDRESSES } from '../wallet/engine/port';
 import type { WalletKind } from '../wallet/registry';
 import { formatZats } from '../wallet/units';
 import { overallProgress } from '../wallet/sync-progress';
+import { MAINNET_EXPLORER_PRESETS, MAINNET_LIGHTWALLETD_PRESETS } from '../wallet/endpoints';
 
 const app = getApp();
 
@@ -107,6 +108,19 @@ function SyncBar() {
   );
 }
 
+function TxLink(props: { txid: string; children?: string }) {
+  const network = useStore(app.network);
+  const explorerId = useStore(app.explorerId);
+  const label = MAINNET_EXPLORER_PRESETS.find((preset) => preset.id === explorerId)?.label ?? 'block explorer';
+  // Explorers in the picker are mainnet. On testnet, keep a bare txid and skip the "View" link.
+  if (network !== 'mainnet') return props.children !== undefined ? null : <>{props.txid}</>;
+  return (
+    <a className="tx-link" href={app.explorerTxUrl(props.txid)} target="_blank" rel="noreferrer" title={`View on ${label}`}>
+      {props.children ?? props.txid}
+    </a>
+  );
+}
+
 function History() {
   const info = useStore(app.walletInfo);
   const sync = useStore(app.sync);
@@ -136,7 +150,7 @@ function History() {
             {e.balanceDelta < 0n ? '' : '+'}
             {formatZats(e.balanceDelta)}
           </strong>{' '}
-          <span className="muted">{e.pools.join('+')}</span>
+          <span className="muted">{e.pools.join('+')}</span> <TxLink txid={e.txid}>View</TxLink>
         </li>
       ))}
     </ul>
@@ -224,7 +238,11 @@ function SendFlow() {
     return (
       <section className="form" aria-label="sent">
         <h2>Sent</h2>
-        {view.txid !== null && <p className="address">{view.txid}</p>}
+        {view.txid !== null && (
+          <p className="address">
+            <TxLink txid={view.txid} />
+          </p>
+        )}
         <button type="button" onClick={() => void app.onSend.close()}>
           Done
         </button>
@@ -384,7 +402,11 @@ function ShieldFlow() {
     return (
       <section className="form" aria-label="shielded">
         <h2>Shielded</h2>
-        {view.txid !== null && <p className="address">{view.txid}</p>}
+        {view.txid !== null && (
+          <p className="address">
+            <TxLink txid={view.txid} />
+          </p>
+        )}
         <button type="button" onClick={() => void app.onShield.close()}>
           Done
         </button>
@@ -746,7 +768,9 @@ function WalletScreen() {
           {info.kind === 'viewonly' && <span className="chip">View-only</span>}
           <NetworkChip />
           {/* ADR-0001: the endpoint operator is a party to your privacy. */}
-          <span className="chip">{new URL(endpoint).host}</span>
+          <button type="button" className="chip-button" title="Choose endpoints" onClick={() => app.openEndpoints()}>
+            {new URL(endpoint).host}
+          </button>
           <AutoLockChip />
         </h1>
         <div className="choices">
@@ -1095,7 +1119,12 @@ function WelcomeScreen() {
         </button>
       </header>
       {/* ADR-0001: one-sentence onboarding disclosure. */}
-      <p className="muted">Your lightwalletd provider can see your activity.</p>
+      <p className="muted">
+        Your lightwalletd provider can see your activity.{' '}
+        <button type="button" className="link" onClick={() => app.openEndpoints()}>
+          Choose endpoints
+        </button>
+      </p>
       {error !== null && <p className="error">{error}</p>}
       <nav className="tabs">
         <button type="button" className={tab === 'create' ? 'on' : ''} onClick={() => setTab('create')}>
@@ -1128,9 +1157,91 @@ function WelcomeScreen() {
 }
 
 
+function EndpointsScreen() {
+  const network = useStore(app.network);
+  const lightwalletdId = useStore(app.lightwalletdId);
+  const explorerId = useStore(app.explorerId);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const chooseServer = async (id: string): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await app.setLightwalletd(id);
+      if (!res.ok) {
+        setError(
+          res.code === 'TRANSPORT_ERROR'
+            ? 'That server did not open. This Wallet is still using the previous one.'
+            : errorText(res, 'Could not switch server'),
+        );
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="screen" aria-label="endpoints">
+      <header className="row">
+        <h1>Endpoints</h1>
+        <button type="button" className="secondary" disabled={busy} onClick={() => app.closeEndpoints()}>
+          Back
+        </button>
+      </header>
+      <p className="muted">
+        Your lightwalletd provider can see your activity. One mainnet server is used at a time. ChainSafe speaks
+        gRPC-Web, which this browser wallet can sync with. The other servers are the public mainnet list.
+      </p>
+      {network === 'testnet' && (
+        <p className="muted">
+          This Wallet is on testnet, so it keeps using zcash-testnet.chainsafe.dev. A mainnet choice is saved for when
+          you switch.
+        </p>
+      )}
+      <h2>Lightwalletd</h2>
+      <div className="endpoint-list" role="radiogroup" aria-label="Lightwalletd">
+        {MAINNET_LIGHTWALLETD_PRESETS.map((preset) => (
+          <button
+            key={preset.id}
+            type="button"
+            role="radio"
+            aria-checked={lightwalletdId === preset.id}
+            className={lightwalletdId === preset.id ? 'on' : ''}
+            disabled={busy}
+            onClick={() => void chooseServer(preset.id)}
+          >
+            <span>{preset.label}</span>
+            <span className="muted">{preset.url}</span>
+          </button>
+        ))}
+      </div>
+      {busy && <p className="muted">Switching server…</p>}
+      <h2>Block explorer</h2>
+      <p className="muted">Opens when you look up a mainnet transaction. The explorer sees that lookup.</p>
+      <div className="endpoint-list" role="radiogroup" aria-label="Block explorer">
+        {MAINNET_EXPLORER_PRESETS.map((preset) => (
+          <button
+            key={preset.id}
+            type="button"
+            role="radio"
+            aria-checked={explorerId === preset.id}
+            className={explorerId === preset.id ? 'on' : ''}
+            disabled={busy}
+            onClick={() => app.setExplorer(preset.id)}
+          >
+            <span>{preset.label}</span>
+            <span className="muted">{preset.url}</span>
+          </button>
+        ))}
+      </div>
+      {error !== null && <p className="error">{error}</p>}
+    </section>
+  );
+}
+
 function SettingsScreen() {
   const network = useStore(app.network);
   const endpoint = useStore(app.endpoint);
+  const explorerId = useStore(app.explorerId);
   const walletInfo = useStore(app.walletInfo);
   const [busy, setBusy] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
@@ -1190,9 +1301,19 @@ function SettingsScreen() {
           Testnet
         </button>
       </div>
+      <h2>Endpoints</h2>
       <p className="muted">
         Lightwalletd <span className="chip">{new URL(endpoint).host}</span>
       </p>
+      <p className="muted">
+        Block explorer{' '}
+        <span className="chip">
+          {MAINNET_EXPLORER_PRESETS.find((preset) => preset.id === explorerId)?.label ?? 'Zcash Explorer'}
+        </span>
+      </p>
+      <button type="button" className="secondary" disabled={busy} onClick={() => app.openEndpoints()}>
+        Choose endpoints
+      </button>
       {walletInfo !== null && (
         <>
           <h2>Remove Wallet</h2>
@@ -1232,6 +1353,7 @@ export default function App() {
       {screen === 'welcome' && <WelcomeScreen />}
       {screen === 'wallet' && <WalletScreen />}
       {screen === 'settings' && <SettingsScreen />}
+      {screen === 'endpoints' && <EndpointsScreen />}
       {screen === 'storage-busy' && (
         <section className="screen" aria-label="storage busy">
           <h1>Wallet storage is busy</h1>

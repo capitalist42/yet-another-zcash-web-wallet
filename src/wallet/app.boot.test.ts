@@ -8,6 +8,7 @@ import { createRegistry, idbRegistryStore, type Registry, type WalletRecord } fr
 import { createFakeEngine, type FakeEngine } from './engine/fake';
 import { createWalletApp, type WalletApp } from './app';
 import { DEFAULT_ENDPOINTS } from './policy';
+import { EXPLORER_PREF_KEY, LIGHTWALLETD_PREF_KEY } from './endpoints';
 import { overallProgress } from './sync-progress';
 import { createVault, idbVaultStore } from './vault';
 import { syncAt, until } from './test-helpers';
@@ -453,5 +454,126 @@ describe('boot choreography', () => {
     await a.setNetwork('testnet'); // a real switch boots again and must drop the old error
     expect(a.screen.get()).toBe('welcome');
     expect(a.bootError.get()).toBeNull();
+  });
+});
+
+describe('endpoint picker', () => {
+  const withStorage = async (run: (saved: Map<string, string>) => Promise<void>): Promise<void> => {
+    const saved = new Map<string, string>();
+    const previous = globalThis.localStorage;
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => saved.get(key) ?? null,
+        setItem: (key: string, value: string) => {
+          saved.set(key, value);
+        },
+        removeItem: (key: string) => {
+          saved.delete(key);
+        },
+      },
+    });
+    try {
+      await run(saved);
+    } finally {
+      if (previous === undefined) delete (globalThis as { localStorage?: Storage }).localStorage;
+      else Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: previous });
+    }
+  };
+
+  it('opens from settings and returns there', async () => {
+    await app.boot();
+    app.openSettings();
+    app.openEndpoints();
+    expect(app.screen.get()).toBe('endpoints');
+    app.closeEndpoints();
+    expect(app.screen.get()).toBe('settings');
+  });
+
+  it('uses the chosen mainnet server for a wallet created afterwards', async () => {
+    const chosen = await app.setLightwalletd('lwd8.zcash-infra.com');
+    expect(chosen.ok).toBe(true);
+    expect(app.endpoint.get()).toBe('https://lwd8.zcash-infra.com:9067');
+    const created = await app.onCreate.generate();
+    const done = await app.onCreate.confirmBackup(created.phrase);
+    expect(done.ok).toBe(true);
+    expect(engine.lastWallet()).toBeDefined();
+    expect(engine.opens.at(-1)!.spec.endpoint).toBe('https://lwd8.zcash-infra.com:9067');
+  });
+
+  it('reconnects an open mainnet wallet and stays on the endpoints page', async () => {
+    await registry.add(row({ id: 'm' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
+    await app.boot();
+    app.openEndpoints();
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
+    const res = await app.setLightwalletd('lwd4.zcash-infra.com');
+    expect(res.ok).toBe(true);
+    expect(app.screen.get()).toBe('endpoints');
+    expect(app.endpoint.get()).toBe('https://lwd4.zcash-infra.com:9067');
+    expect(engine.opens).toHaveLength(2);
+    expect(engine.opens[1]!.spec.endpoint).toBe('https://lwd4.zcash-infra.com:9067');
+    expect(engine.opens[0]!.wallet.closed).toBe(true);
+    app.closeEndpoints();
+    expect(app.screen.get()).toBe('wallet');
+    expect(app.walletInfo.get()?.id).toBe('m');
+  });
+
+  it('restores the previous server when the new one fails to open', async () => {
+    await registry.add(row({ id: 'm' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
+    await app.boot();
+    app.openEndpoints();
+    engine.queueWallet({ openError: 'TRANSPORT_ERROR' });
+    engine.queueWallet({ accounts: [{ id: 'acct-m' }] });
+    const res = await app.setLightwalletd('lwd3.zcash-infra.com');
+    expect(res.ok).toBe(false);
+    expect(res.code).toBe('TRANSPORT_ERROR');
+    expect(app.lightwalletdId.get()).toBe('chainsafe');
+    expect(app.endpoint.get()).toBe('https://zcash-mainnet.chainsafe.dev');
+    expect(app.screen.get()).toBe('endpoints');
+    expect(app.walletInfo.get()?.id).toBe('m');
+    expect(engine.opens.at(-1)!.spec.endpoint).toBe('https://zcash-mainnet.chainsafe.dev');
+  });
+
+  it('saves a mainnet server on testnet without retargeting the testnet client', async () => {
+    app.network.set('testnet');
+    await registry.add(row({ id: 't', network: 'testnet' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-t' }] });
+    await app.boot();
+    const res = await app.setLightwalletd('lwd2.zcash-infra.com');
+    expect(res.ok).toBe(true);
+    expect(app.endpoint.get()).toContain('zcash-testnet');
+    expect(engine.opens).toHaveLength(1);
+    expect(app.lightwalletdId.get()).toBe('lwd2.zcash-infra.com');
+  });
+
+  it('refuses an unknown server and ignores an unknown explorer', async () => {
+    const res = await app.setLightwalletd('not-a-server');
+    expect(res.ok).toBe(false);
+    app.setExplorer('not-an-explorer');
+    expect(app.explorerId.get()).toBe('zcashexplorer');
+    expect(app.explorerTxUrl('abc')).toBe('https://mainnet.zcashexplorer.app/transactions/abc');
+  });
+
+  it('persists the mainnet server and block explorer across a reload', async () => {
+    await withStorage(async (saved) => {
+      expect((await app.setLightwalletd('lwd1.zcash-infra.com')).ok).toBe(true);
+      app.setExplorer('blockchair');
+      expect(saved.get(LIGHTWALLETD_PREF_KEY)).toBe('lwd1.zcash-infra.com');
+      expect(saved.get(EXPLORER_PREF_KEY)).toBe('blockchair');
+      expect(app.explorerTxUrl('dead')).toBe('https://blockchair.com/zcash/transaction/dead');
+      const reloaded = createWalletApp({
+        engine: engine.engine,
+        registry,
+        vault: createVault(idbVaultStore()),
+        endpoints: DEFAULT_ENDPOINTS,
+        requestPersist: async () => true,
+      });
+      expect(reloaded.lightwalletdId.get()).toBe('lwd1.zcash-infra.com');
+      expect(reloaded.endpoint.get()).toBe('https://lwd1.zcash-infra.com:9067');
+      expect(reloaded.explorerId.get()).toBe('blockchair');
+      expect(reloaded.explorerTxUrl('dead')).toBe('https://blockchair.com/zcash/transaction/dead');
+    });
   });
 });

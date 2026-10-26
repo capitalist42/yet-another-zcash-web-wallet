@@ -58,7 +58,8 @@ export const RECOVERY_POLICY: { mode: 'online'; timeoutMs: number } = {
  */
 export const ALLOW_TRANSPARENT_SENDS = false;
 
-/** Per-network endpoint settings; free-text override lands in #12. */
+/** Per-network default endpoint. A saved mainnet choice in `endpoints.ts`
+ * replaces `mainnet`. Free-text override lands in #12. */
 export interface EndpointSettings {
   readonly mainnet: string;
   readonly testnet: string;

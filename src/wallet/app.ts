@@ -23,13 +23,26 @@ import type {
 import { EngineError, isNonTerminal, MAX_SHIELD_ADDRESSES } from './engine/port';
 import type { Registry, WalletKind, WalletRecord } from './registry';
 import { ALLOW_TRANSPARENT_SENDS, frozenPolicy, storageName, FRESHNESS_TIMEOUT_MS, type EndpointSettings } from './policy';
+import {
+  DEFAULT_EXPLORER_ID,
+  DEFAULT_LIGHTWALLETD_ID,
+  EXPLORER_PREF_KEY,
+  LIGHTWALLETD_PREF_KEY,
+  MAINNET_EXPLORER_PRESETS,
+  MAINNET_LIGHTWALLETD_PRESETS,
+  presetById,
+  readPresetId,
+  savedLightwalletdUrl,
+  transactionUrl,
+  writeEndpointPref,
+} from './endpoints';
 import { fingerprintFromUfvk } from './fingerprint';
 import { generatePhrase, normalizePhrase, phraseBytes, zeroize } from './keys';
 import { formatZats, parseZecAmount } from './units';
 import { classifyAddress, parseZip321 } from './zip321';
 import { VaultError, type Vault, type VaultErrorCode } from './vault';
 
-export type Screen = 'booting' | 'welcome' | 'wallet' | 'settings' | 'storage-busy';
+export type Screen = 'booting' | 'welcome' | 'wallet' | 'settings' | 'endpoints' | 'storage-busy';
 
 export interface WalletInfo {
   readonly id: string;
@@ -183,6 +196,12 @@ export interface WalletApp {
   readonly network: WritableAtom<NetworkId>;
   /** Active lightwalletd endpoint; persistent chip (ADR-0001 disclosure). */
   readonly endpoint: ReadableAtom<string>;
+  /** Selected mainnet lightwalletd preset. Applied when the network is mainnet. */
+  readonly lightwalletdId: ReadableAtom<string>;
+  /** Selected mainnet block explorer preset. */
+  readonly explorerId: ReadableAtom<string>;
+  /** Public lookup URL for one transaction on the selected explorer. */
+  explorerTxUrl(txid: string): string;
   readonly walletInfo: ReadableAtom<WalletInfo | null>;
   readonly balances: ReadableAtom<EngineBalance | null>;
   /** Size of this Wallet's persisted Exclude set (issue #9). */
@@ -222,6 +241,14 @@ export interface WalletApp {
   openSettings(): void;
   /** Leave Settings for the open wallet, or welcome when none is open. */
   closeSettings(): void;
+  /** Open the endpoint picker. The open wallet stays up until a mainnet server change reconnects it. */
+  openEndpoints(): void;
+  /** Leave the endpoint picker for the screen that opened it. */
+  closeEndpoints(): void;
+  /** Use one public mainnet lightwalletd server. Reconnects an open mainnet wallet. */
+  setLightwalletd(id: string): Promise<ImportResult>;
+  /** Use one public mainnet block explorer for transaction lookups. */
+  setExplorer(id: string): void;
   /** Erase the current Wallet (Settings → Remove Wallet): close the client,
    * delete its OPFS storage, drop the registry row, land on welcome. */
   removeWallet(): Promise<ImportResult>;
@@ -524,7 +551,16 @@ const proposalDeviates = (proposal: EngineProposal, allowed: ReadonlySet<string>
 export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const screen = atom<Screen>('booting');
   const network = atom<NetworkId>(networkFromQuery() ?? 'mainnet');
-  const endpoint = atom<string>(deps.endpoints[network.get()]);
+  // In-memory so a choice applies even when localStorage is unavailable.
+  // Null means "use the injected default" (tests, and first run).
+  let chosenMainnetUrl: string | null = savedLightwalletdUrl();
+  const endpointFor = (net: NetworkId): string =>
+    net === 'mainnet' && chosenMainnetUrl !== null ? chosenMainnetUrl : deps.endpoints[net];
+  const endpoint = atom<string>(endpointFor(network.get()));
+  const lightwalletdId = atom<string>(
+    readPresetId(LIGHTWALLETD_PREF_KEY, MAINNET_LIGHTWALLETD_PRESETS, DEFAULT_LIGHTWALLETD_ID),
+  );
+  const explorerId = atom<string>(readPresetId(EXPLORER_PREF_KEY, MAINNET_EXPLORER_PRESETS, DEFAULT_EXPLORER_ID));
   const walletInfo = atom<WalletInfo | null>(null);
   const balances = atom<EngineBalance | null>(null);
   const sync = atom<EngineSyncStatus | null>(null);
@@ -563,6 +599,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   let heldDeviation = false;
   let heldAccepted = false;
   let openSeq = 0;
+  /** Screen to restore when the endpoint picker closes. */
+  let endpointsReturn: Screen = 'settings';
   let createPhrase: string | null = null;
   let backupConfirmed = false;
   /** Custody choice awaiting the create's success (issue #6). Survives a
@@ -869,7 +907,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
    * Finish opening a wallet whose Client is live: recovery is complete
    * (it ran inside open), serve balances from the LOCAL DB, then start sync.
    */
-  const finishOpen = async (w: EngineWallet, record: WalletRecord, showZeroUntilScan = false): Promise<void> => {
+  const finishOpen = async (
+    w: EngineWallet,
+    record: WalletRecord,
+    showZeroUntilScan = false,
+    keepScreen = false,
+  ): Promise<void> => {
     wallet = w;
     // ADR-0004 rotation state belongs to exactly one open. The create path
     // arrives here without resetStores, so the clear lives here too.
@@ -920,7 +963,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       await w.startSync();
     }
     await deps.registry.touch(record.id);
-    screen.set('wallet');
+    if (!keepScreen) screen.set('wallet');
     // Session/Lock boot check (issue #6): the ONLY unlock guarantee. A valid
     // mirror re-attaches the signer from already-decrypted bytes (NOT a
     // decrypt — the mirror is plaintext in sessionStorage). A Lock flag or an
@@ -933,13 +976,14 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
    * Boot order per issue #3 — registry → open last-used Wallet → await
    * startup recovery (inside open) → balances from local DB → start sync.
    */
-  const openWallet = async (record: WalletRecord): Promise<void> => {
+  const openWallet = async (record: WalletRecord, opts?: { keepScreen?: boolean }): Promise<void> => {
     const seq = openSeq;
-    screen.set('booting');
+    const keepScreen = opts?.keepScreen === true;
+    if (!keepScreen) screen.set('booting');
     resetStores();
     const w = await deps.engine.open({
       network: record.network,
-      endpoint: deps.endpoints[record.network],
+      endpoint: endpointFor(record.network),
       storageName: storageName(record.network, record.id),
       allowTransparentSends: ALLOW_TRANSPARENT_SENDS,
     });
@@ -947,7 +991,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       await w.close(); // superseded by a newer open (network switch)
       return;
     }
-    await finishOpen(w, record);
+    await finishOpen(w, record, false, keepScreen);
   };
 
   const boot = async (opts?: { restoreLatest?: boolean }): Promise<void> => {
@@ -965,7 +1009,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           if (pref !== null) network.set(pref);
         }
       }
-      endpoint.set(deps.endpoints[network.get()]);
+      endpoint.set(endpointFor(network.get()));
       const last = await deps.registry.lastUsed(network.get());
       if (last === null) {
         await closeWallet();
@@ -989,7 +1033,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (next === network.get()) return;
     writeNetworkPref(next);
     network.set(next);
-    endpoint.set(deps.endpoints[next]);
+    endpoint.set(endpointFor(next));
     await closeWallet();
     await boot();
   };
@@ -1003,6 +1047,88 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const closeSettings = (): void => {
     if (screen.get() !== 'settings') return;
     screen.set(wallet !== null ? 'wallet' : 'welcome');
+  };
+
+  const openEndpoints = (): void => {
+    const current = screen.get();
+    if (current !== 'welcome' && current !== 'wallet' && current !== 'settings') return;
+    endpointsReturn = current;
+    screen.set('endpoints');
+  };
+
+  const closeEndpoints = (): void => {
+    if (screen.get() !== 'endpoints') return;
+    if (endpointsReturn === 'settings') {
+      screen.set('settings');
+      return;
+    }
+    screen.set(wallet !== null ? 'wallet' : 'welcome');
+  };
+
+  const explorerTxUrl = (txid: string): string => {
+    const preset = presetById(MAINNET_EXPLORER_PRESETS, explorerId.get()) ?? MAINNET_EXPLORER_PRESETS[0];
+    if (preset === undefined) return txid;
+    return transactionUrl(preset, txid);
+  };
+
+  const setExplorer = (id: string): void => {
+    const preset = presetById(MAINNET_EXPLORER_PRESETS, id);
+    if (preset === null) return;
+    writeEndpointPref(EXPLORER_PREF_KEY, preset.id);
+    explorerId.set(preset.id);
+  };
+
+  /**
+   * Switch the mainnet lightwalletd server. Testnet keeps its own endpoint;
+   * the choice is saved for the next mainnet session. An open mainnet wallet
+   * is reconnected. If the new server fails to open, the previous server is
+   * restored so the Wallet does not disappear.
+   */
+  const setLightwalletd = async (id: string): Promise<ImportResult> => {
+    const preset = presetById(MAINNET_LIGHTWALLETD_PRESETS, id);
+    if (preset === null)
+      return { ok: false, code: 'INVALID_ARGUMENT', message: 'Unknown lightwalletd server.' };
+    if (creating.get())
+      return {
+        ok: false,
+        code: 'INVALID_ARGUMENT',
+        message: 'Finish opening this Wallet before changing the server.',
+      };
+    const previousId = lightwalletdId.get();
+    const previousUrl = endpoint.get();
+    if (preset.id === previousId && (network.get() !== 'mainnet' || previousUrl === preset.url))
+      return { ok: true };
+    writeEndpointPref(LIGHTWALLETD_PREF_KEY, preset.id);
+    lightwalletdId.set(preset.id);
+    chosenMainnetUrl = preset.url;
+    if (network.get() !== 'mainnet') return { ok: true };
+    const info = walletInfo.get();
+    const record = info === null ? null : await deps.registry.get(info.id).catch(() => null);
+    const rebind = record !== null && record.network === 'mainnet' && wallet !== null;
+    endpoint.set(preset.url);
+    if (!rebind || record === null) return { ok: true };
+    const keep = screen.get() === 'endpoints';
+    try {
+      await closeWallet();
+      await openWallet(record, { keepScreen: keep });
+      return { ok: true };
+    } catch (e) {
+      writeEndpointPref(LIGHTWALLETD_PREF_KEY, previousId);
+      lightwalletdId.set(previousId);
+      chosenMainnetUrl = MAINNET_LIGHTWALLETD_PRESETS.some((item) => item.url === previousUrl)
+        ? previousUrl
+        : savedLightwalletdUrl();
+      endpoint.set(endpointFor('mainnet'));
+      if (wallet !== null) await closeWallet().catch(() => undefined);
+      try {
+        await openWallet(record, { keepScreen: keep });
+      } catch {
+        screen.set(keep ? 'endpoints' : 'welcome');
+        return asResult(e);
+      }
+      if (keep) screen.set('endpoints');
+      return asResult(e);
+    }
   };
 
   /**
@@ -1078,7 +1204,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     try {
       w = await deps.engine.open({
         network: net,
-        endpoint: deps.endpoints[net],
+        endpoint: endpointFor(net),
         storageName: storageName(net, id),
         allowTransparentSends: ALLOW_TRANSPARENT_SENDS,
       });
@@ -1388,7 +1514,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         pendingWalletId = crypto.randomUUID();
         w = await deps.engine.open({
           network: net,
-          endpoint: deps.endpoints[net],
+          endpoint: endpointFor(net),
           storageName: storageName(net, pendingWalletId),
           allowTransparentSends: ALLOW_TRANSPARENT_SENDS,
         });
@@ -2244,6 +2370,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     screen,
     network,
     endpoint,
+    lightwalletdId,
+    explorerId,
+    explorerTxUrl,
     walletInfo,
     balances,
     excludedCount,
@@ -2266,6 +2395,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     setNetwork,
     openSettings,
     closeSettings,
+    openEndpoints,
+    closeEndpoints,
+    setLightwalletd,
+    setExplorer,
     removeWallet,
     onCreate,
     onRestore,
