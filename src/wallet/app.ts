@@ -525,6 +525,11 @@ const noteKey = (note: NoteId): string => `${note.pool}:${note.txid}:${note.outp
 const sameNote = (a: NoteId, b: NoteId): boolean =>
   a.pool === b.pool && a.txid === b.txid && a.outputIndex === b.outputIndex;
 
+/** Accept consent binds to the selection snapshot at accept time: excluding
+ * another input afterwards must not inherit the older accept (issue #9). */
+const sameSelectionSnapshot = (a: readonly NoteId[], b: readonly NoteId[]): boolean =>
+  a.length === b.length && a.every((x) => b.some((y) => sameNote(x, y)));
+
 /** Unspent notes the user has not Excluded. Transparent notes stay out while
  * transparent sends are off — the Send screen already refuses those inputs. */
 const allowedNoteKeys = (inventory: readonly EngineNote[], excludedIds: readonly NoteId[]): Set<string> => {
@@ -598,6 +603,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   /** Whether `held` spends outside the selection, and whether that was accepted. */
   let heldDeviation = false;
   let heldAccepted = false;
+  /** Selection snapshot the deviation accept consented to; null = none. */
+  let acceptedSelection: readonly NoteId[] | null = null;
+  /** A second confirm while the first awaits never reaches the engine. */
+  let sendInFlight = false;
   let openSeq = 0;
   /** Screen to restore when the endpoint picker closes. */
   let endpointsReturn: Screen = 'settings';
@@ -632,6 +641,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     held = null;
     heldDeviation = false;
     heldAccepted = false;
+    acceptedSelection = null;
     excluded.set([]);
     notes.set([]);
     send.set({ phase: 'closed' });
@@ -648,6 +658,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     held = null;
     heldDeviation = false;
     heldAccepted = false;
+    acceptedSelection = null;
     send.set({ phase: 'closed' });
     const w = wallet;
     wallet = null;
@@ -1811,6 +1822,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     held = null;
     heldDeviation = false;
     heldAccepted = false;
+    acceptedSelection = null;
     if (op === null || current === null) return releaseTail;
     const run = (): Promise<void> => {
       releasesInFlight += 1;
@@ -2011,6 +2023,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         }
         heldDeviation = deviates;
         heldAccepted = false;
+        acceptedSelection = null;
         showReview(draft, proposal, null);
       } catch (error) {
         await routeEngine(error, draft, false);
@@ -2021,18 +2034,53 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       if (view.phase !== 'review' || held === null || wallet === null) return;
       // A deviant plan is not consent. The user has to accept the real inputs.
       if (view.deviation && !view.accepted) return;
-      const draft = readDraft(view);
-      // Broadcasting is a spend attempt → activity (issue #6).
-      touchIdle();
+      // The re-check below awaits; a second tap past the guards would reach
+      // wallet.send with the same held proposal twice.
+      if (sendInFlight) return;
+      sendInFlight = true;
       try {
-        const result = await wallet.send(held.proposalId);
-        held = null;
-        heldDeviation = false;
-        heldAccepted = false;
-        await refreshOperations();
-        send.set({ phase: 'sent', txid: result.txid });
-      } catch (error) {
-        await routeEngine(error, draft, true);
+        // The note browser stays live under review: a note Excluded after the
+        // review was painted lands this plan's input outside the selection.
+        // Re-assert against the current selection before broadcasting, so an
+        // Excluded note is never spent without a fresh explicit accept. The
+        // broadcast path fails closed: an inventory read error counts as
+        // deviation inside selectionDeviates.
+        const account = await defaultAccount(wallet);
+        if (account === undefined) return;
+        const w = wallet;
+        const plan = held;
+        const deviates = await selectionDeviates(w, account.id, plan);
+        // The user may have left review or released the plan during the read;
+        // never broadcast into a screen that moved on.
+        if (send.get() !== view || held !== plan) return;
+        // Consent covers only the selection as it stood at accept time.
+        const consented =
+          view.accepted &&
+          acceptedSelection !== null &&
+          sameSelectionSnapshot(acceptedSelection, excluded.get());
+        if (deviates && !consented) {
+          heldDeviation = true;
+          heldAccepted = false;
+          acceptedSelection = null;
+          send.set({ ...view, deviation: true, accepted: false });
+          return;
+        }
+        const draft = readDraft(view);
+        // Broadcasting is a spend attempt → activity (issue #6).
+        touchIdle();
+        try {
+          const result = await wallet.send(plan.proposalId);
+          held = null;
+          heldDeviation = false;
+          heldAccepted = false;
+          acceptedSelection = null;
+          await refreshOperations();
+          send.set({ phase: 'sent', txid: result.txid });
+        } catch (error) {
+          await routeEngine(error, draft, true);
+        }
+      } finally {
+        sendInFlight = false;
       }
     },
     async unlock(phrase: string): Promise<void> {
@@ -2090,6 +2138,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       const view = send.get();
       if (view.phase !== 'review' || !view.deviation || view.accepted || held === null) return;
       heldAccepted = true;
+      // Consent covers the selection right now, nothing that changes later.
+      acceptedSelection = excluded.get();
       send.set({ ...view, accepted: true });
     },
   };

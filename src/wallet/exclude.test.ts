@@ -168,4 +168,74 @@ describe('proposal input assertion', () => {
     await app.onSend.confirm();
     expect(wallet.sentProposalIds).toEqual(['prop-deviate']);
   });
+
+  it('a new exclusion while the review is open forces a fresh explicit accept', async () => {
+    await seedNotes();
+    await app.onNotes.exclude(NOTE_A);
+    const wallet = engine.lastWallet();
+    const plan = spending('prop-late', NOTE_B);
+    wallet.queueProposal(plan, 'bb-tx');
+    fill();
+    await app.onSend.review();
+    expect(app.send.get()).toMatchObject({ phase: 'review', deviation: false, accepted: false });
+
+    // The note browser stays live under the review: exclude its input now.
+    await app.onNotes.exclude(NOTE_B);
+    await app.onSend.confirm();
+    expect(wallet.sentProposalIds).toEqual([]);
+    expect(app.send.get()).toMatchObject({ phase: 'review', deviation: true, accepted: false });
+
+    app.onSend.acceptInputs();
+    await app.onSend.confirm();
+    expect(wallet.sentProposalIds).toEqual(['prop-late']);
+  });
+
+  it('an exclusion added after accepting a deviation forces a fresh accept', async () => {
+    await seedNotes();
+    await app.onNotes.exclude(NOTE_A);
+    const wallet = engine.lastWallet();
+    const plan: EngineProposal = {
+      ...spending('prop-stale', NOTE_A),
+      steps: [
+        {
+          expiryHeight: 50,
+          fee: 1_000n,
+          inputs: [
+            { pool: 'sapling', value: 50_000_000n, note: NOTE_A },
+            { pool: 'sapling', value: 80_000_000n, note: NOTE_B },
+          ],
+          outputs: [{ kind: 'payment', pool: 'sapling', address: SAPLING, amount: 128_000_000n, memo: null }],
+        },
+      ],
+    };
+    wallet.queueProposal(plan, 'ab-tx');
+    fill();
+    await app.onSend.review();
+    expect(app.send.get()).toMatchObject({ phase: 'review', deviation: true, accepted: false });
+    app.onSend.acceptInputs();
+    expect(app.send.get()).toMatchObject({ deviation: true, accepted: true });
+
+    // Consent was for the selection at accept time: exclude the OTHER input.
+    await app.onNotes.exclude(NOTE_B);
+    await app.onSend.confirm();
+    expect(wallet.sentProposalIds).toEqual([]);
+    expect(app.send.get()).toMatchObject({ phase: 'review', deviation: true, accepted: false });
+
+    app.onSend.acceptInputs();
+    await app.onSend.confirm();
+    expect(wallet.sentProposalIds).toEqual(['prop-stale']);
+  });
+
+  it('a double confirm broadcasts the held proposal exactly once', async () => {
+    await seedNotes();
+    const wallet = engine.lastWallet();
+    wallet.queueProposal(spending('prop-twice', NOTE_B), 'bb-tx');
+    fill();
+    await app.onSend.review();
+    expect(app.send.get()).toMatchObject({ phase: 'review', deviation: false });
+    // Two taps before either confirm's awaits settle (issue #9: confirm now
+    // awaits an inventory read, widening the window between guard and send).
+    await Promise.all([app.onSend.confirm(), app.onSend.confirm()]);
+    expect(wallet.sentProposalIds).toEqual(['prop-twice']);
+  });
 });
