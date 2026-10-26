@@ -35,8 +35,10 @@ import type {
   EngineRecoveryReport,
   EngineSeedAccount,
   EngineSendResult,
+  EngineShieldArgs,
   EngineSyncStatus,
   EngineTransactionOutput,
+  EngineTransparentUtxo,
   EngineWallet,
   OpenSpec,
 } from './port';
@@ -58,6 +60,9 @@ const mapError = (e: unknown): EngineError => {
     'SYNC_REQUIRED',
     'TIMEOUT',
     'RUNTIME_UNAVAILABLE',
+    // SDK code of the same name; the Shield screen explains it in plain
+    // language instead of routing on recovery (issue #8).
+    'NOTHING_TO_SHIELD',
   ];
   // ACCOUNT_BUSY is the same lease collision the UI renders as storage-busy.
   const code: EngineErrorCode = known.includes(e.code as EngineErrorCode)
@@ -388,6 +393,41 @@ class AdapterWallet implements EngineWallet {
       });
       this.proposals.set(proposal.proposalId, proposal);
       return projectProposal(proposal);
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  /** Reviewable shielding: propose({kind:'shield'}) only. The SDK's
+   * `shield()` is propose→finalize→broadcast with NO review window — it is
+   * never called; execution reuses send({proposal}) on these stored bytes. */
+  async proposeShield(args: EngineShieldArgs): Promise<EngineProposal> {
+    try {
+      const proposal = await this.client.propose({
+        kind: 'shield',
+        accountId: args.accountId as AccountId,
+        fromAddresses: args.fromAddresses,
+        threshold: args.threshold,
+      });
+      this.proposals.set(proposal.proposalId, proposal);
+      return projectProposal(proposal);
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  async listTransparentUtxos(accountId: string): Promise<readonly EngineTransparentUtxo[]> {
+    try {
+      // Unspent only; address is null for outputs this Wallet cannot map
+      // (foreign scripts it merely observed) — the checkbox list has no row
+      // to offer for those, so they are dropped.
+      const page = await this.client.listUtxos({
+        accountId: accountId as AccountId,
+        spendState: 'unspent',
+      });
+      return page.items
+        .filter((u): u is typeof u & { address: string } => u.address !== null)
+        .map((u) => ({ address: u.address, value: u.value }));
     } catch (e) {
       throw mapError(e);
     }

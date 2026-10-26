@@ -23,6 +23,8 @@ export type EngineErrorCode =
   | 'TIMEOUT'
   /** SDK artifact acquisition/integrity failure; recoverable by reloading fresh assets. */
   | 'RUNTIME_UNAVAILABLE'
+  /** No eligible transparent funds meet the shielding request (issue #8). */
+  | 'NOTHING_TO_SHIELD'
   | 'UNKNOWN'
 
 /** How the UI should recover. Routing keys off this, not the raw message. */
@@ -156,6 +158,24 @@ export interface EngineProposeArgs {
   readonly memo?: string;
 }
 
+/** One unspent transparent output, projected to the shielding form's needs:
+ * the checkbox list groups by address (the SDK's selection granularity). */
+export interface EngineTransparentUtxo {
+  readonly address: string;
+  readonly value: bigint;
+}
+
+/** SDK `propose({kind:'shield'}).fromAddresses` cap. Address-level, not per output. */
+export const MAX_SHIELD_ADDRESSES = 16;
+
+/** Shielding intent: shield UTXOs on these addresses only, skipping any
+ * single UTXO below `threshold` (dust filter). */
+export interface EngineShieldArgs {
+  readonly accountId: string;
+  readonly fromAddresses: readonly string[];
+  readonly threshold: bigint;
+}
+
 export interface EngineSendResult {
   readonly operationId: string;
   readonly phase: EngineOperationPhase;
@@ -228,6 +248,16 @@ export interface EngineWallet {
   syncFresh(timeoutMs: number): Promise<void>;
   listOperations(): Promise<readonly EngineOperation[]>;
   propose(args: EngineProposeArgs): Promise<EngineProposal>;
+  /**
+   * Reviewable shielding plan (issue #8): transparent inputs from
+   * `fromAddresses` only, UTXOs below `threshold` excluded. The SDK's
+   * one-call `shield()` (propose→broadcast, no review window) deliberately
+   * never enters this port — execution is `send(proposalId)`.
+   */
+  proposeShield(args: EngineShieldArgs): Promise<EngineProposal>;
+  /** Unspent transparent outputs grouped per address (SDK granularity is
+   * address-level); feeds the Shield screen's checkbox list. */
+  listTransparentUtxos(accountId: string): Promise<readonly EngineTransparentUtxo[]>;
   /** Broadcast exactly the proposal `propose` returned. */
   send(proposalId: string): Promise<EngineSendResult>;
   /** Retire an unsent proposal and release its input locks. */

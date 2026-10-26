@@ -1,11 +1,13 @@
 // Product screens: boot states, welcome, onboarding (create + forced backup
-// gate / restore / view-only import), the wallet screen, and send (#3/#4/#5).
+// gate / restore / view-only import), the wallet screen, send (#3/#4/#5),
+// and shielding (#8).
 import { useEffect, useRef, useState } from 'react';
 import { useStore } from '@nanostores/react';
 import { toCanvas } from 'qrcode';
 import { getApp, startApp } from './wiring';
-import type { ImportResult, RememberChoice, RestoreBirthday, SendNotice } from '../wallet/app';
+import type { ImportResult, RememberChoice, RestoreBirthday, SendNotice, ShieldNotice } from '../wallet/app';
 import type { EngineHistoryEntry, EngineProposal, NetworkId } from '../wallet/engine/port';
+import { MAX_SHIELD_ADDRESSES } from '../wallet/engine/port';
 import type { WalletKind } from '../wallet/registry';
 import { formatZats } from '../wallet/units';
 import { overallProgress } from '../wallet/sync-progress';
@@ -326,6 +328,163 @@ function SendFlow() {
   );
 }
 
+const shieldNoticeText = (notice: ShieldNotice): string | null => {
+  if (notice === null) return null;
+  switch (notice.kind) {
+    case 'invalid-threshold':
+      return 'Enter the dust threshold as a whole number of zats.';
+    case 'empty-selection':
+      return 'Select at least one transparent address.';
+    case 'too-many-addresses':
+      return `Select at most ${MAX_SHIELD_ADDRESSES} addresses. Shield the rest in another pass.`;
+    case 'nothing-to-shield':
+      return 'Nothing to shield. Every output on the selected addresses is under the dust threshold, or those addresses have nothing spendable.';
+    case 'unavailable':
+      return 'This Wallet cannot shield right now.';
+    case 'view-only':
+      return 'No spend authority — this Wallet is view-only.';
+    case 'locked':
+      return 'This Wallet is locked. Unlock it to shield.';
+    case 'phrase':
+      return 'Enter the 24-word recovery phrase for this Wallet.';
+    case 'engine':
+      return `The wallet refused the shield (${notice.code}).`;
+  }
+};
+
+/** Address checkboxes, dust threshold, then the same Proposal review send uses.
+ * The SDK shields whole addresses (at most 16), so the list never offers a
+ * single output. */
+function ShieldFlow() {
+  const view = useStore(app.shield);
+  const [phrase, setPhrase] = useState('');
+  if (view.phase === 'closed') return null;
+  if (view.phase === 'sent') {
+    return (
+      <section className="form" aria-label="shielded">
+        <h2>Shielded</h2>
+        {view.txid !== null && <p className="address">{view.txid}</p>}
+        <button type="button" onClick={() => void app.onShield.close()}>
+          Done
+        </button>
+      </section>
+    );
+  }
+  if (view.phase === 'sync') {
+    return (
+      <section className="form" aria-label="sync required">
+        <h2>Sync</h2>
+        <p>Sync this Wallet before shielding.</p>
+        <button type="button" className="secondary" onClick={() => app.onShield.backToForm()}>
+          Back
+        </button>
+      </section>
+    );
+  }
+  if (view.phase === 'unlock') {
+    const text = shieldNoticeText(view.notice);
+    return (
+      <section className="form" aria-label="unlock">
+        <h2>Unlock</h2>
+        <p>Enter this Wallet&apos;s recovery phrase to shield.</p>
+        <label>
+          Recovery Phrase
+          <textarea rows={3} value={phrase} onChange={(e) => setPhrase(e.target.value)} />
+        </label>
+        {text !== null && <p className="error">{text}</p>}
+        <div className="choices">
+          <button type="button" onClick={() => void app.onShield.unlock(phrase)}>
+            Unlock
+          </button>
+          <button type="button" className="secondary" onClick={() => app.onShield.backToForm()}>
+            Back
+          </button>
+        </div>
+      </section>
+    );
+  }
+  if (view.phase === 'review') {
+    const text = shieldNoticeText(view.notice);
+    return (
+      <section className="form" aria-label="proposal review">
+        <h2>Review Proposal</h2>
+        <ProposalTable proposal={view.proposal} />
+        {text !== null && <p className="error">{text}</p>}
+        <div className="choices">
+          <button type="button" data-testid="confirm-shield" onClick={() => void app.onShield.confirm()}>
+            Shield
+          </button>
+          <button type="button" className="secondary" onClick={() => app.onShield.edit()}>
+            Back
+          </button>
+        </div>
+      </section>
+    );
+  }
+  const text = shieldNoticeText(view.notice);
+  return (
+    <section className="form" aria-label="shield">
+      <h2>Shield</h2>
+      <p>
+        Moves transparent funds on the addresses you check into the shielded pool. Each box is one whole
+        address — outputs on it shield together and cannot be picked one by one. At most {MAX_SHIELD_ADDRESSES}{' '}
+        addresses.
+      </p>
+      <label>
+        Dust threshold (zats)
+        <input
+          value={view.draft.threshold}
+          inputMode="numeric"
+          data-testid="shield-threshold"
+          onChange={(e) => app.onShield.setThreshold(e.target.value)}
+        />
+      </label>
+      <p className="muted">Outputs smaller than this stay transparent. The default is 10 000 zats.</p>
+      {!view.draft.ready ? (
+        <p className="muted">Looking up transparent addresses…</p>
+      ) : view.draft.addresses.length === 0 ? (
+        <p data-testid="shield-empty">No transparent funds to shield.</p>
+      ) : (
+        <ul className="history" aria-label="transparent addresses">
+          {view.draft.addresses.map((row) => (
+            <li key={row.address}>
+              <label className="shield-address">
+                <input
+                  type="checkbox"
+                  checked={row.checked}
+                  data-testid="shield-address"
+                  data-address={row.address}
+                  onChange={() => app.onShield.toggle(row.address)}
+                />
+                <span>
+                  <span className="address">{row.address}</span>
+                  <span className="muted">
+                    {' '}
+                    {formatZats(row.zats)} ZEC · {row.utxoCount} {row.utxoCount === 1 ? 'output' : 'outputs'}
+                  </span>
+                </span>
+              </label>
+            </li>
+          ))}
+        </ul>
+      )}
+      {text !== null && (
+        <p className="error" data-testid="shield-notice">
+          {text}
+        </p>
+      )}
+      <div className="choices">
+        <button type="button" data-testid="shield-review" onClick={() => void app.onShield.review()}>
+          Review
+        </button>
+        <button type="button" className="secondary" onClick={() => void app.onShield.close()}>
+          Cancel
+        </button>
+      </div>
+    </section>
+  );
+}
+
 /** Auto-Lock countdown chip (issue #6): visible only while unlocked. The
  * deadline is activity-based — a send attempt resets it, watching sync does
  * not — and there is no hard cap, so this is the only honest countdown. */
@@ -495,6 +654,7 @@ function WalletScreen() {
   const gatePending = useStore(app.backupPending);
   const creating = useStore(app.creating);
   const send = useStore(app.send);
+  const shield = useStore(app.shield);
   if (info === null) return null;
   return (
     <section className="screen" aria-label="wallet">
@@ -542,10 +702,17 @@ function WalletScreen() {
       <div className="actions">
         {gatePending ? (
           <p className="muted">New wallet. The balance stays at zero until a payment arrives.</p>
-        ) : canSpend && send.phase === 'closed' ? (
-          <button type="button" onClick={() => app.onSend.open()}>
-            Send
-          </button>
+        ) : canSpend && send.phase === 'closed' && shield.phase === 'closed' ? (
+          <div className="choices">
+            <button type="button" onClick={() => void app.onSend.open()}>
+              Send
+            </button>
+            <button type="button" data-testid="open-shield" onClick={() => void app.onShield.open()}>
+              Shield
+            </button>
+          </div>
+        ) : canSpend && shield.phase !== 'closed' ? (
+          <ShieldFlow />
         ) : canSpend ? (
           <SendFlow />
         ) : info.kind === 'seed' ? (

@@ -14,12 +14,13 @@ import type {
   EngineProposal,
   EngineRecovery,
   EngineSyncStatus,
+  EngineTransparentUtxo,
   EngineWallet,
   NetworkId,
 } from './engine/port';
-import { EngineError, isNonTerminal } from './engine/port';
+import { EngineError, isNonTerminal, MAX_SHIELD_ADDRESSES } from './engine/port';
 import type { Registry, WalletKind, WalletRecord } from './registry';
-import { ALLOW_TRANSPARENT_SENDS, storageName, FRESHNESS_TIMEOUT_MS, type EndpointSettings } from './policy';
+import { ALLOW_TRANSPARENT_SENDS, frozenPolicy, storageName, FRESHNESS_TIMEOUT_MS, type EndpointSettings } from './policy';
 import { fingerprintFromUfvk } from './fingerprint';
 import { generatePhrase, normalizePhrase, phraseBytes, zeroize } from './keys';
 import { formatZats, parseZecAmount } from './units';
@@ -113,6 +114,53 @@ export type SendView =
   | { readonly phase: 'sync'; readonly draft: SendDraftView }
   | { readonly phase: 'sent'; readonly txid: string | null };
 
+/** One checkbox row of the Shield screen: ALL of one address's spendable
+ * transparent utxos (the SDK's selection granularity is the address, so the
+ * UI never promises per-utxo choice — issue #8). */
+export interface ShieldAddressRow {
+  readonly address: string;
+  readonly zats: bigint;
+  readonly utxoCount: number;
+  readonly checked: boolean;
+}
+
+export interface ShieldDraftView {
+  /** Whole zats, integer text; parsed on review. */
+  readonly threshold: string;
+  readonly addresses: readonly ShieldAddressRow[];
+  /** False until the address list has been read. An empty list before that
+   * is not "nothing to shield". */
+  readonly ready: boolean;
+}
+
+export type ShieldNotice =
+  | null
+  | {
+      readonly kind:
+        | 'invalid-threshold'
+        | 'empty-selection'
+        | 'too-many-addresses'
+        | 'nothing-to-shield'
+        | 'unavailable'
+        | 'view-only'
+        | 'locked'
+        | 'phrase';
+    }
+  | { readonly kind: 'engine'; readonly code: EngineErrorCode; readonly recovery: EngineRecovery };
+
+export type ShieldView =
+  | { readonly phase: 'closed' }
+  | { readonly phase: 'form'; readonly draft: ShieldDraftView; readonly notice: ShieldNotice }
+  | {
+      readonly phase: 'review';
+      readonly draft: ShieldDraftView;
+      readonly proposal: EngineProposal;
+      readonly notice: ShieldNotice;
+    }
+  | { readonly phase: 'unlock'; readonly draft: ShieldDraftView; readonly notice: ShieldNotice }
+  | { readonly phase: 'sync'; readonly draft: ShieldDraftView }
+  | { readonly phase: 'sent'; readonly txid: string | null };
+
 export interface WalletApp {
   // --- stores (UI subscribes; tests assert) --------------------------------
   readonly screen: ReadableAtom<Screen>;
@@ -192,7 +240,7 @@ export interface WalletApp {
   unlockWithPhrase(phrase: string): Promise<ImportResult>;
   readonly send: ReadableAtom<SendView>;
   readonly onSend: {
-    open(): void;
+    open(): Promise<void>;
     close(): Promise<void>;
     setRecipient(text: string): void;
     setAmount(text: string): void;
@@ -203,6 +251,23 @@ export interface WalletApp {
     /** Re-enter the seed phrase after a reattach-signer recovery. */
     unlock(phrase: string): Promise<void>;
     /** Leave the sync route and rebuild the payment. */
+    backToForm(): void;
+    /** Leave review without sending. The proposal is released. */
+    edit(): void;
+  };
+  readonly shield: ReadableAtom<ShieldView>;
+  readonly onShield: {
+    /** Rebuilds the checkbox list from the current utxo set. */
+    open(): Promise<void>;
+    close(): Promise<void>;
+    setThreshold(text: string): void;
+    toggle(address: string): void;
+    review(): Promise<void>;
+    /** Broadcast the proposal currently on the review screen. */
+    confirm(): Promise<void>;
+    /** Re-enter the seed phrase after a reattach-signer recovery. */
+    unlock(phrase: string): Promise<void>;
+    /** Leave the sync route and rebuild the shielding plan. */
     backToForm(): void;
     /** Leave review without sending. The proposal is released. */
     edit(): void;
@@ -416,6 +481,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const creating = atom<boolean>(false);
   const bootError = atom<string | null>(null);
   const send = atom<SendView>({ phase: 'closed' });
+  const shield = atom<ShieldView>({ phase: 'closed' });
   /** Mandatory Exposed Address list (ADR-0004); rebuilt by observeHistory. */
   const exposedAddresses = atom<readonly ExposedAddress[]>([]);
 
@@ -1038,6 +1104,15 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
    * Lock flag. Viewing continues. The flag survives reload until the next Unlock. */
   const lock = async (): Promise<void> => {
     stopAutoLock();
+    // Drop spend authority before the first await. Shield and send review
+    // read the guard synchronously; waiting on detach would let a review
+    // that starts after Lock still propose (issue #8).
+    clearMirror();
+    setLockFlag();
+    unlocked.set(false);
+    unlockDeadline.set(null);
+    autoLockInMs.set(null);
+    canSpend.set(false);
     const w = wallet;
     const info = walletInfo.get();
     if (w !== null && info?.kind === 'seed') {
@@ -1050,12 +1125,6 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         }
       }
     }
-    clearMirror();
-    setLockFlag();
-    unlocked.set(false);
-    unlockDeadline.set(null);
-    autoLockInMs.set(null);
-    canSpend.set(false);
   };
 
   /** Shared Unlock guard: an open seed Wallet plus its default account, or
@@ -1548,11 +1617,14 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   };
 
   const onSend = {
-    open(): void {
+    async open(): Promise<void> {
       const phase = send.get().phase;
       if (phase !== 'closed' && phase !== 'sent') return;
       if (!spendGuard().ok) return;
+      // Form first, so a caller that doesn't await still sees the send draft.
+      // Then drop any shield plan: both flows share one held proposal.
       showForm(emptyDraft(), null);
+      await onShield.close();
     },
     async close(): Promise<void> {
       await releaseHeld();
@@ -1702,6 +1774,278 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     },
   };
 
+  // --- Shielding (issue #8) -------------------------------------------------
+  // Same held-proposal lock as send: opening either flow releases the other's
+  // proposal, and confirm() broadcasts exactly the reviewed bytes via
+  // send(proposalId). The SDK's one-call shield() is never reachable.
+  interface ShieldDraft {
+    threshold: string;
+    rows: readonly ShieldAddressRow[];
+    ready: boolean;
+  }
+
+  const asDraftView = (draft: ShieldDraft): ShieldDraftView => ({
+    threshold: draft.threshold,
+    addresses: draft.rows,
+    ready: draft.ready,
+  });
+
+  const showShieldForm = (draft: ShieldDraft, notice: ShieldNotice): void => {
+    shield.set({ phase: 'form', draft: asDraftView(draft), notice });
+  };
+
+  const readShieldDraft = (view: { readonly draft: ShieldDraftView }): ShieldDraft => ({
+    threshold: view.draft.threshold,
+    rows: view.draft.addresses,
+    ready: view.draft.ready,
+  });
+
+  /** Group the flat utxo list by address, first-seen order, all checked. */
+  const groupUtxos = (utxos: readonly EngineTransparentUtxo[]): readonly ShieldAddressRow[] => {
+    const byAddress = new Map<string, ShieldAddressRow>();
+    for (const u of utxos) {
+      const row = byAddress.get(u.address);
+      if (row === undefined) {
+        byAddress.set(u.address, { address: u.address, zats: u.value, utxoCount: 1, checked: true });
+      } else {
+        byAddress.set(u.address, { ...row, zats: row.zats + u.value, utxoCount: row.utxoCount + 1 });
+      }
+    }
+    return [...byAddress.values()];
+  };
+
+  /** Threshold text → whole zats. '' = the frozen policy default. */
+  const parseThreshold = (text: string): bigint | null => {
+    const trimmed = text.trim();
+    if (trimmed === '') return frozenPolicy(ALLOW_TRANSPARENT_SENDS).shieldingThreshold;
+    if (!/^\d+$/.test(trimmed)) return null;
+    return BigInt(trimmed);
+  };
+
+  /** Recovery routing shared with send, except NOTHING_TO_SHIELD is explained
+   * on the form first: the SDK maps that code's recovery to 'correct-input',
+   * and a generic "invalid input" dead end must not swallow the plain-language
+   * explanation (issue #8). */
+  const routeShield = async (error: unknown, draft: ShieldDraft, keepProposal: boolean): Promise<void> => {
+    const viewOf = (notice: ShieldNotice): Extract<ShieldView, { phase: 'form' }> => ({
+      phase: 'form',
+      draft: asDraftView(draft),
+      notice,
+    });
+    if (error instanceof EngineError && error.code === 'NOTHING_TO_SHIELD') {
+      await releaseHeld();
+      shield.set(viewOf({ kind: 'nothing-to-shield' }));
+      return;
+    }
+    if (!(error instanceof EngineError)) {
+      await releaseHeld();
+      shield.set(viewOf({ kind: 'engine', code: 'UNKNOWN', recovery: 'none' }));
+      return;
+    }
+    if (error.recovery === 'sync') {
+      await releaseHeld();
+      shield.set({ phase: 'sync', draft: asDraftView(draft) });
+      return;
+    }
+    if (error.recovery === 'reattach-signer') {
+      shield.set({ phase: 'unlock', draft: asDraftView(draft), notice: null });
+      return;
+    }
+    if (error.recovery === 'review-new-proposal') {
+      await releaseHeld();
+      showShieldForm(draft, null);
+      return;
+    }
+    const engineNotice: ShieldNotice = { kind: 'engine', code: error.code, recovery: error.recovery };
+    if (keepProposal && held !== null) {
+      shield.set({
+        phase: 'review',
+        draft: asDraftView(draft),
+        proposal: held,
+        notice: engineNotice,
+      });
+      return;
+    }
+    showShieldForm(draft, engineNotice);
+  };
+
+  const editShieldDraft = (next: ShieldDraft): void => {
+    const phase = shield.get().phase;
+    if (phase !== 'form' && phase !== 'review') return;
+    if (phase === 'review') void releaseHeld();
+    showShieldForm(next, null);
+  };
+
+  const onShield = {
+    async open(): Promise<void> {
+      const phase = shield.get().phase;
+      if (phase !== 'closed' && phase !== 'sent') return;
+      if (!spendGuard().ok) return;
+      // One review at a time: opening shielding closes send, which releases
+      // any held send proposal through the shared lock.
+      await onSend.close();
+      const draft: ShieldDraft = {
+        threshold: String(frozenPolicy(ALLOW_TRANSPARENT_SENDS).shieldingThreshold),
+        rows: [],
+        ready: false,
+      };
+      showShieldForm(draft, null);
+      if (wallet === null) return;
+      const account = await defaultAccount(wallet);
+      if (account === undefined) return;
+      const rows = groupUtxos(await wallet.listTransparentUtxos(account.id));
+      // A close() during the await discards this late list.
+      if (shield.get().phase !== 'form') return;
+      showShieldForm({ threshold: draft.threshold, rows, ready: true }, null);
+    },
+    async close(): Promise<void> {
+      await releaseHeld();
+      shield.set({ phase: 'closed' });
+    },
+    setThreshold(text: string): void {
+      const view = shield.get();
+      if (view.phase !== 'form' && view.phase !== 'review') return;
+      editShieldDraft({ ...readShieldDraft(view), threshold: text });
+    },
+    toggle(address: string): void {
+      const view = shield.get();
+      if (view.phase !== 'form' && view.phase !== 'review') return;
+      const draft = readShieldDraft(view);
+      editShieldDraft({
+        ...draft,
+        rows: draft.rows.map((row) => (row.address === address ? { ...row, checked: !row.checked } : row)),
+      });
+    },
+    async review(): Promise<void> {
+      const view = shield.get();
+      if ((view.phase !== 'form' && view.phase !== 'review') || wallet === null) return;
+      const draft = readShieldDraft(view);
+      const guard = spendGuard();
+      if (!guard.ok) {
+        showShieldForm(draft, guard.reason === 'view-only' ? { kind: 'view-only' } : guard.reason === 'locked' ? { kind: 'locked' } : { kind: 'unavailable' });
+        return;
+      }
+      touchIdle();
+      const threshold = parseThreshold(draft.threshold);
+      if (threshold === null) {
+        if (view.phase === 'review') void releaseHeld();
+        showShieldForm(draft, { kind: 'invalid-threshold' });
+        return;
+      }
+      const fromAddresses = draft.rows.filter((row) => row.checked).map((row) => row.address);
+      if (fromAddresses.length === 0) {
+        if (view.phase === 'review') void releaseHeld();
+        showShieldForm(draft, { kind: 'empty-selection' });
+        return;
+      }
+      if (fromAddresses.length > MAX_SHIELD_ADDRESSES) {
+        if (view.phase === 'review') void releaseHeld();
+        showShieldForm(draft, { kind: 'too-many-addresses' });
+        return;
+      }
+      await releaseHeld();
+      const account = await defaultAccount(wallet);
+      if (account === undefined) {
+        showShieldForm(draft, { kind: 'unavailable' });
+        return;
+      }
+      try {
+        const proposal = await wallet.proposeShield({ accountId: account.id, fromAddresses, threshold });
+        held = proposal;
+        shield.set({
+          phase: 'review',
+          draft: asDraftView(draft),
+          proposal,
+          notice: null,
+        });
+      } catch (error) {
+        await routeShield(error, draft, false);
+      }
+    },
+    async confirm(): Promise<void> {
+      const view = shield.get();
+      if (view.phase !== 'review' || held === null || wallet === null) return;
+      const draft = readShieldDraft(view);
+      const guard = spendGuard();
+      if (!guard.ok) {
+        // Lock already dropped spend authority. Release the plan so its
+        // inputs are not stuck, and do not broadcast.
+        await releaseHeld();
+        showShieldForm(
+          draft,
+          guard.reason === 'view-only' ? { kind: 'view-only' } : guard.reason === 'locked' ? { kind: 'locked' } : { kind: 'unavailable' },
+        );
+        return;
+      }
+      touchIdle();
+      try {
+        const result = await wallet.send(held.proposalId);
+        held = null;
+        await refreshOperations();
+        shield.set({ phase: 'sent', txid: result.txid });
+      } catch (error) {
+        await routeShield(error, draft, true);
+      }
+    },
+    async unlock(phrase: string): Promise<void> {
+      const view = shield.get();
+      if (view.phase !== 'unlock' || wallet === null) return;
+      const draft = readShieldDraft(view);
+      let normalized: string;
+      try {
+        normalized = normalizePhrase(phrase);
+      } catch {
+        shield.set({ phase: 'unlock', draft: view.draft, notice: { kind: 'phrase' } });
+        return;
+      }
+      const bytes = phraseBytes(normalized);
+      traceSecret(bytes);
+      try {
+        const account = await defaultAccount(wallet);
+        if (account === undefined) {
+          shield.set({ phase: 'unlock', draft: view.draft, notice: { kind: 'unavailable' } });
+          return;
+        }
+        await wallet.attachSigner({ accountId: account.id, mnemonic: bytes });
+        // Mirrors onSend.unlock (issue #6 session model): enter unlocked state
+        // without a Vault mirror write; keep the held proposal for the retry.
+        clearLockFlag();
+        unlocked.set(true);
+        unlockDeadline.set(Date.now() + AUTO_LOCK_MS);
+        autoLockInMs.set(AUTO_LOCK_MS);
+        canSpend.set(true);
+        startAutoLock();
+        touchIdle();
+        if (held !== null) {
+          shield.set({
+            phase: 'review',
+            draft: asDraftView(draft),
+            proposal: held,
+            notice: null,
+          });
+        } else {
+          showShieldForm(draft, null);
+        }
+      } catch (error) {
+        await routeShield(error, draft, held !== null);
+      } finally {
+        zeroize(bytes);
+      }
+    },
+    backToForm(): void {
+      const view = shield.get();
+      if (view.phase !== 'sync' && view.phase !== 'unlock') return;
+      if (view.phase === 'unlock') void releaseHeld();
+      showShieldForm(readShieldDraft(view), null);
+    },
+    edit(): void {
+      const view = shield.get();
+      if (view.phase !== 'review') return;
+      void releaseHeld();
+      showShieldForm(readShieldDraft(view), null);
+    },
+  };
+
   return {
     screen,
     network,
@@ -1736,6 +2080,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     unlockWithPhrase,
     send,
     onSend,
+    shield,
+    onShield,
     async history(): Promise<readonly EngineHistoryEntry[]> {
       if (wallet === null) return [];
       const account = await defaultAccount(wallet);

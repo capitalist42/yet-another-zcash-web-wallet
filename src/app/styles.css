@@ -120,6 +120,14 @@ input[type='radio'] {
   align-items: center;
   gap: 8px;
 }
+.shield-address {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.shield-address input[type='checkbox'] {
+  margin-top: 12px;
+}
 .custody {
   border: 1px solid var(--border);
   border-radius: 6px;

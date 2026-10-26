@@ -17,8 +17,10 @@ import type {
   EngineRecoveryReport,
   EngineSeedAccount,
   EngineSendResult,
+  EngineShieldArgs,
   EngineSyncStatus,
   EngineTransactionOutput,
+  EngineTransparentUtxo,
   EngineWallet,
   OpenSpec,
 } from './port';
@@ -48,6 +50,9 @@ export interface FakeAccountSpec {
   /** txid → outputs, for ADR-0004 receipt classification. `addTransaction`
    * scripts one mid-session (a sync tick then sees it in `history`). */
   transactions?: Record<string, EngineTransactionOutput[]>;
+  /** Unspent transparent outputs for the Shield screen (issue #8); the app
+   * groups these by address for its checkbox list. */
+  utxos?: { address: string; value: bigint }[];
 }
 
 export interface FakeWalletSpec {
@@ -142,6 +147,7 @@ export class FakeWallet implements EngineWallet {
   readonly watchers: SyncWatcher[] = [];
   readonly operations: EngineOperation[];
   readonly proposeArgs: EngineProposeArgs[] = [];
+  readonly proposeShieldArgs: EngineShieldArgs[] = [];
   readonly sentProposalIds: string[] = [];
   readonly abandoned: string[] = [];
   readonly attachArgs: { accountId: string; mnemonic: Uint8Array }[] = [];
@@ -149,9 +155,13 @@ export class FakeWallet implements EngineWallet {
   private readonly specs = new Map<string, FakeAccountSpec>();
   private readonly proposalQueue: { proposal: EngineProposal; txid: string | null }[] = [];
   private readonly proposeFails: ScriptedFailure[] = [];
+  private readonly proposeShieldFails: ScriptedFailure[] = [];
   private readonly sendFails: ScriptedFailure[] = [];
   /** proposalId → txid returned by a successful send of that exact proposal. */
   private readonly heldTxids = new Map<string, string | null>();
+  /** Shield proposals awaiting accept: which utxos a successful send of
+   * that exact proposal consumes (issue #8 balance/utxo bookkeeping). */
+  private readonly shieldProposals = new Map<string, { accountId: string; utxos: EngineTransparentUtxo[]; fee: bigint }>();
   /** When set, abandon() records the release only after releaseAbandon(). */
   private abandonGate: Promise<void> = Promise.resolve();
   private letAbandon: (() => void) | null = null;
@@ -181,6 +191,12 @@ export class FakeWallet implements EngineWallet {
     this.specs.set(spec.id, { ...spec });
   }
 
+  /** Script the account's unspent transparent outputs (Shield screen,
+   * issue #8). */
+  setUtxos(accountId: string, utxos: { address: string; value: bigint }[]): void {
+    this.need(accountId).utxos = utxos.map((u) => ({ ...u }));
+  }
+
   pushSync(status: EngineSyncStatus): void {
     this.lastStatus = status;
     for (const w of this.watchers) w.push(status);
@@ -198,6 +214,10 @@ export class FakeWallet implements EngineWallet {
 
   failNextPropose(failure: ScriptedFailure): void {
     this.proposeFails.push(failure);
+  }
+
+  failNextProposeShield(failure: ScriptedFailure): void {
+    this.proposeShieldFails.push(failure);
   }
 
   failNextSend(failure: ScriptedFailure): void {
@@ -462,6 +482,53 @@ export class FakeWallet implements EngineWallet {
     return proposal;
   }
 
+  /** Models the SDK's shielding selector: only UTXOs on the selected
+   * addresses AND at/above `threshold` enter the proposal; nothing eligible
+   * rejects NOTHING_TO_SHIELD exactly like the engine (issue #8). */
+  async proposeShield(args: EngineShieldArgs): Promise<EngineProposal> {
+    this.check('proposeShield');
+    this.proposeShieldArgs.push(args);
+    const fail = this.proposeShieldFails.shift();
+    if (fail !== undefined) throw new EngineError(fail.code, fail.message ?? fail.code, false, fail.recovery);
+    const utxos = (this.need(args.accountId).utxos ?? []).filter(
+      (u) => args.fromAddresses.includes(u.address) && u.value >= args.threshold,
+    );
+    if (utxos.length === 0) {
+      throw new EngineError('NOTHING_TO_SHIELD', 'No eligible transparent funds meet the shielding request.');
+    }
+    const fee = 10_000n;
+    const total = utxos.reduce((sum, u) => sum + u.value, 0n);
+    const proposal: EngineProposal = {
+      proposalId: `prop-${nextId++}`,
+      operationId: `op-${nextId++}`,
+      totalFee: fee,
+      steps: [
+        {
+          expiryHeight: 1,
+          fee,
+          inputs: utxos.map((u) => ({ pool: 'transparent' as const, value: u.value })),
+          outputs: [
+            {
+              kind: 'change' as const,
+              pool: 'ironwood' as const,
+              address: null,
+              amount: total - fee,
+              memo: null,
+            },
+          ],
+        },
+      ],
+    };
+    this.heldTxids.set(proposal.proposalId, `shieldtx-${proposal.proposalId}`);
+    this.shieldProposals.set(proposal.proposalId, { accountId: args.accountId, utxos, fee });
+    return proposal;
+  }
+
+  async listTransparentUtxos(accountId: string): Promise<readonly EngineTransparentUtxo[]> {
+    this.check('listTransparentUtxos');
+    return (this.need(accountId).utxos ?? []).map((u) => ({ ...u }));
+  }
+
   async send(proposalId: string): Promise<EngineSendResult> {
     this.check('send');
     this.sentProposalIds.push(proposalId);
@@ -473,6 +540,34 @@ export class FakeWallet implements EngineWallet {
     const txid = this.heldTxids.get(proposalId) ?? null;
     const operationId = `op-send-${proposalId}`;
     this.operations.push({ operationId, phase: 'observing', txid });
+    const shield = this.shieldProposals.get(proposalId);
+    if (shield !== undefined) {
+      // Accepted shielding consumes its utxos and moves value transparent →
+      // ironwood, exactly what the balances screen then shows (issue #8).
+      const spec = this.need(shield.accountId);
+      const consumed = new Set(shield.utxos);
+      const total = shield.utxos.reduce((sum, u) => sum + u.value, 0n);
+      spec.utxos = (spec.utxos ?? []).filter((u) => !consumed.has(u));
+      if (spec.balance !== undefined) {
+        spec.balance = {
+          ...spec.balance,
+          transparent: (spec.balance.transparent ?? 0n) - total,
+          ironwood: (spec.balance.ironwood ?? 0n) + total - shield.fee,
+        };
+      }
+      this.addTransaction(
+        shield.accountId,
+        {
+          txid: `shieldtx-${proposalId}`,
+          minedHeight: null,
+          blockTime: null,
+          balanceDelta: -shield.fee,
+          pools: ['transparent', 'ironwood'],
+          isShielding: true,
+        },
+        [],
+      );
+    }
     return { operationId, phase: 'observing', txid };
   }
 
