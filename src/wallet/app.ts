@@ -1960,7 +1960,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       void releaseHeld();
       showForm(readDraft(view), null);
     },
-        acceptInputs(): void {
+    acceptInputs(): void {
       const view = send.get();
       if (view.phase !== 'review' || !view.deviation || view.accepted || held === null) return;
       heldAccepted = true;
