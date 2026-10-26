@@ -111,9 +111,11 @@ export type SendView =
       readonly draft: SendDraftView;
       readonly proposal: EngineProposal;
       readonly notice: SendNotice;
-      /** A chain input spends a note outside the non-excluded selection. */
+      /** A chain input spends a note outside the non-excluded selection.
+       * Tracks Exclude while this review is open. */
       readonly deviation: boolean;
-      /** The user accepted that real Proposal. Ignored when deviation is false. */
+      /** The user accepted the inputs that are outside the selection now.
+       * Ignored when deviation is false. */
       readonly accepted: boolean;
     }
   | { readonly phase: 'unlock'; readonly draft: SendDraftView; readonly notice: SendNotice }
@@ -513,13 +515,26 @@ const allowedNoteKeys = (inventory: readonly EngineNote[], excludedIds: readonly
   return allowed;
 };
 
-/** True when a chain input spends a note outside the selection. The SDK has
- * no forced-inputs API, so this is the check instead of a selector argument.
- * A prior-step input has no note id and is not a user note. */
+/** Note keys of chain inputs outside the selection, sorted. A prior-step
+ * input has no note id and is not a user note. The SDK has no forced-inputs
+ * API, so this is the check instead of a selector argument. */
+const deviantNoteKeys = (proposal: EngineProposal, allowed: ReadonlySet<string>): readonly string[] => {
+  const keys: string[] = [];
+  for (const step of proposal.steps) {
+    for (const input of step.inputs) {
+      if (input.note !== undefined && !allowed.has(noteKey(input.note))) keys.push(noteKey(input.note));
+    }
+  }
+  keys.sort();
+  return keys;
+};
+
+const sameNoteKeys = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((key, index) => key === b[index]);
+
+/** True when a chain input spends a note outside the selection. */
 const proposalDeviates = (proposal: EngineProposal, allowed: ReadonlySet<string>): boolean =>
-  proposal.steps.some((step) =>
-    step.inputs.some((input) => input.note !== undefined && !allowed.has(noteKey(input.note))),
-  );
+  deviantNoteKeys(proposal, allowed).length > 0;
 
 export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const screen = atom<Screen>('booting');
@@ -562,6 +577,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   /** Whether `held` spends outside the selection, and whether that was accepted. */
   let heldDeviation = false;
   let heldAccepted = false;
+  /** Inventory the send review checked. Later Exclude edits are applied to this. */
+  let heldInventory: readonly EngineNote[] | null = null;
+  /** Deviant note keys the user accepted. A different set withdraws consent. */
+  let acceptedDeviantKeys: readonly string[] | null = null;
+  /** Filled in once the review view exists. Exclude calls it while a plan is held. */
+  let syncHeldSelection: () => void = () => {};
   let openSeq = 0;
   let createPhrase: string | null = null;
   let backupConfirmed = false;
@@ -580,6 +601,13 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   /** Id of a create that is on screen but not registered yet. */
   let pendingWalletId: string | null = null;
 
+  const clearHeldConsent = (): void => {
+    heldDeviation = false;
+    heldAccepted = false;
+    heldInventory = null;
+    acceptedDeviantKeys = null;
+  };
+
   const resetStores = (): void => {
     walletInfo.set(null);
     balances.set(null);
@@ -592,8 +620,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     canSpend.set(false);
     bootError.set(null);
     held = null;
-    heldDeviation = false;
-    heldAccepted = false;
+    clearHeldConsent();
     excluded.set([]);
     notes.set([]);
     send.set({ phase: 'closed' });
@@ -608,8 +635,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     stopAutoLock();
     const op = held?.operationId ?? null;
     held = null;
-    heldDeviation = false;
-    heldAccepted = false;
+    clearHeldConsent();
     send.set({ phase: 'closed' });
     const w = wallet;
     wallet = null;
@@ -653,6 +679,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (info === null) return;
     excluded.set(next);
     notes.set(notes.get().map((row) => ({ ...row, excluded: next.some((id) => sameNote(id, row.id)) })));
+    // The note list stays mounted on review, so this write is the new selection.
+    syncHeldSelection();
     const rec = await deps.registry.get(info.id);
     if (rec === null) return;
     await deps.registry.add({ ...rec, excludedNotes: next });
@@ -677,21 +705,15 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     },
   };
 
-  /** Identified inputs outside the current unspent, non-excluded selection.
-   * Inventory failure fails closed: every identified input is a deviation. */
-  const selectionDeviates = async (
-    w: EngineWallet,
-    accountId: string,
-    proposal: EngineProposal,
-  ): Promise<boolean> => {
-    let inventory: readonly EngineNote[] = [];
+  /** Shielded notes plus transparent UTXOs. A failed read is an empty
+   * inventory, so every identified input is outside the selection. */
+  const readInventory = async (w: EngineWallet, accountId: string): Promise<readonly EngineNote[]> => {
     try {
       const [shielded, utxos] = await Promise.all([w.listNotes(accountId), w.listUtxos(accountId)]);
-      inventory = [...shielded, ...utxos];
+      return [...shielded, ...utxos];
     } catch {
-      inventory = [];
+      return [];
     }
-    return proposalDeviates(proposal, allowedNoteKeys(inventory, excluded.get()));
   };
 
   const refreshOperations = async (): Promise<void> => {
@@ -1677,6 +1699,24 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     memo: view.draft.memo,
   });
 
+  // The note list stays mounted on review, so Exclude can move the selection
+  // after the first deviation flag was captured. Recompute from the inventory
+  // that review checked and the excluded set as it stands now.
+  syncHeldSelection = (): void => {
+    if (held === null || heldInventory === null) return;
+    const keys = deviantNoteKeys(held, allowedNoteKeys(heldInventory, excluded.get()));
+    const deviates = keys.length > 0;
+    const accepted =
+      heldAccepted && acceptedDeviantKeys !== null && sameNoteKeys(keys, acceptedDeviantKeys);
+    heldDeviation = deviates;
+    heldAccepted = accepted;
+    if (!accepted) acceptedDeviantKeys = null;
+    const view = send.get();
+    if (view.phase !== 'review') return;
+    if (view.deviation === deviates && view.accepted === accepted) return;
+    showReview(readDraft(view), held, view.notice);
+  };
+
   /** In-flight abandon. A new propose waits on this so input locks are free. */
   let releaseTail: Promise<void> = Promise.resolve();
   let releasesInFlight = 0;
@@ -1685,8 +1725,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     const op = held?.operationId ?? null;
     const current = wallet;
     held = null;
-    heldDeviation = false;
-    heldAccepted = false;
+    clearHeldConsent();
     if (op === null || current === null) return releaseTail;
     const run = (): Promise<void> => {
       releasesInFlight += 1;
@@ -1868,8 +1907,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         // outside the selection), the review shows that real plan and confirm
         // waits for an explicit accept. Inventory is read after propose; if the
         // user left or edited the draft during that read, drop the plan instead
-        // of painting a review they already dismissed.
-        const deviates = await selectionDeviates(wallet, account.id, proposal);
+        // of painting a review they already dismissed. The note list stays up,
+        // so a later Exclude recomputes against this same inventory.
+        const inventory = await readInventory(wallet, account.id);
         if (held !== proposal) return;
         const current = send.get();
         if (current.phase !== 'form' && current.phase !== 'review') {
@@ -1885,8 +1925,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           await releaseHeld();
           return;
         }
-        heldDeviation = deviates;
+        heldInventory = inventory;
+        heldDeviation = proposalDeviates(proposal, allowedNoteKeys(inventory, excluded.get()));
         heldAccepted = false;
+        acceptedDeviantKeys = null;
         showReview(draft, proposal, null);
       } catch (error) {
         await routeEngine(error, draft, false);
@@ -1895,8 +1937,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     async confirm(): Promise<void> {
       const view = send.get();
       if (view.phase !== 'review' || held === null || wallet === null) return;
-      // A deviant plan is not consent. The user has to accept the real inputs.
-      if (view.deviation && !view.accepted) return;
+      // Notes stay on this screen, so the excluded set may have moved since
+      // review captured its flag. Broadcast only the plan that still matches
+      // the selection, or the inputs the user accepted for this set.
+      syncHeldSelection();
+      if (send.get().phase !== 'review' || held === null || heldInventory === null) return;
+      if (heldDeviation && !heldAccepted) return;
       const draft = readDraft(view);
       const guard = spendGuard();
       if (!guard.ok) {
@@ -1914,8 +1960,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       try {
         const result = await wallet.send(held.proposalId);
         held = null;
-        heldDeviation = false;
-        heldAccepted = false;
+        clearHeldConsent();
         await refreshOperations();
         send.set({ phase: 'sent', txid: result.txid });
       } catch (error) {
@@ -1975,7 +2020,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     },
     acceptInputs(): void {
       const view = send.get();
-      if (view.phase !== 'review' || !view.deviation || view.accepted || held === null) return;
+      if (view.phase !== 'review' || !view.deviation || view.accepted || held === null || heldInventory === null) {
+        return;
+      }
+      const keys = deviantNoteKeys(held, allowedNoteKeys(heldInventory, excluded.get()));
+      if (keys.length === 0) return;
+      acceptedDeviantKeys = keys;
       heldAccepted = true;
       send.set({ ...view, accepted: true });
     },
