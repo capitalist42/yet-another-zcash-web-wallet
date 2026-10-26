@@ -1,6 +1,9 @@
+import type { NoteId } from './engine/port';
+
 // App-side Wallet registry in IndexedDB (ADR-0003): many Wallets per Network,
 // one open per Network, last-used drives startup. SDK-side OPFS state is not
 // listed here; the registry row is the app's index into it.
+
 export type WalletKind = 'seed' | 'viewonly';
 
 export interface WalletRecord {
@@ -12,6 +15,8 @@ export interface WalletRecord {
   readonly kind: WalletKind;
   /** Epoch ms of last open; drives "reopen last-used per Network". */
   readonly lastUsed: number;
+  /** Notes the user Excluded. Absent on rows written before coin control. */
+  readonly excludedNotes?: readonly NoteId[];
 }
 
 /** Minimal KV surface so tests run against fake-indexeddb. */

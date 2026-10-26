@@ -123,9 +123,31 @@ export const isNonTerminal = (phase: EngineOperationPhase): boolean =>
 
 export type EnginePool = 'transparent' | 'sapling' | 'ironwood';
 
+/** Identity of one note or transparent UTXO. Exclude is stored as these. */
+export interface NoteId {
+  readonly pool: EnginePool;
+  readonly txid: string;
+  readonly outputIndex: number;
+}
+
+export type SpendState = 'unspent' | 'pendingSpend' | 'spent' | 'unknown';
+
+/** One inventory row for the note browser. `locked` is the SDK's
+ * operation-held input lock — display-only. It is not the user's Exclude. */
+export interface EngineNote {
+  readonly id: NoteId;
+  readonly value: bigint;
+  readonly spendState: SpendState;
+  readonly locked: boolean;
+  readonly address: string | null;
+}
+
 export interface EngineProposalInput {
   readonly pool: EnginePool;
   readonly value: bigint;
+  /** Chain note this input spends. Absent for a prior-step input, which is
+   * not a note the user can Exclude. */
+  readonly note?: NoteId;
 }
 
 export interface EngineProposalOutput {
@@ -258,6 +280,12 @@ export interface EngineWallet {
   /** Unspent transparent outputs grouped per address (SDK granularity is
    * address-level); feeds the Shield screen's checkbox list. */
   listTransparentUtxos(accountId: string): Promise<readonly EngineTransparentUtxo[]>;
+  /** Shielded notes, every spend state. The browser shows `spendState` and
+   * the operation lock as display-only truth (issue #9). */
+  listNotes(accountId: string): Promise<readonly EngineNote[]>;
+  /** Transparent UTXOs with the same columns as `listNotes`. Distinct from
+   * `listTransparentUtxos`, which drops identity for the Shield checkboxes. */
+  listUtxos(accountId: string): Promise<readonly EngineNote[]>;
   /** Broadcast exactly the proposal `propose` returned. */
   send(proposalId: string): Promise<EngineSendResult>;
   /** Retire an unsent proposal and release its input locks. */

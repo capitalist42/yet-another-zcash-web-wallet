@@ -189,8 +189,14 @@ function ProposalTable(props: { proposal: EngineProposal }) {
           <h3>Inputs</h3>
           <ul className="history">
             {step.inputs.map((input, i) => (
-              <li key={`${input.pool}-${i}`}>
+              <li key={`${input.pool}-${input.note?.txid ?? 'step'}-${input.note?.outputIndex ?? i}`}>
                 {input.pool} {formatZats(input.value)}
+                {input.note !== undefined && (
+                  <span className="muted">
+                    {' '}
+                    {input.note.txid}:{input.note.outputIndex}
+                  </span>
+                )}
               </li>
             ))}
           </ul>
@@ -264,9 +270,24 @@ function SendFlow() {
       <section className="form" aria-label="proposal review">
         <h2>Review Proposal</h2>
         <ProposalTable proposal={view.proposal} />
+        {view.deviation && (
+          <p className="warning" data-testid="selection-deviation">
+            This Proposal spends notes outside your selection. The inputs above are the ones that would actually be spent.
+          </p>
+        )}
         {text !== null && <p className="error">{text}</p>}
         <div className="choices">
-          <button type="button" data-testid="confirm-send" onClick={() => void app.onSend.confirm()}>
+          {view.deviation && !view.accepted && (
+            <button type="button" data-testid="accept-inputs" onClick={() => app.onSend.acceptInputs()}>
+              Accept these inputs
+            </button>
+          )}
+          <button
+            type="button"
+            data-testid="confirm-send"
+            disabled={view.deviation && !view.accepted}
+            onClick={() => void app.onSend.confirm()}
+          >
             Send
           </button>
           <button type="button" className="secondary" onClick={() => app.onSend.edit()}>
@@ -644,6 +665,67 @@ function ReceivePanel({ kind }: { kind: WalletKind }) {
   );
 }
 
+function ExcludedCount() {
+  const n = useStore(app.excludedCount);
+  return (
+    <li className="excluded-count" data-testid="excluded-count">
+      <span>{n} excluded</span>
+      <button
+        type="button"
+        className="secondary"
+        data-testid="reset-excluded"
+        disabled={n === 0}
+        onClick={() => void app.onNotes.reset()}
+      >
+        Reset
+      </button>
+    </li>
+  );
+}
+
+function NotesBrowser() {
+  const rows = useStore(app.notes);
+  if (rows.length === 0) return null;
+  return (
+    <div className="notes-section">
+      <h2>Notes</h2>
+      <table className="notes">
+        <thead>
+          <tr>
+            <th>Note</th>
+            <th>Value</th>
+            <th>Spend</th>
+            <th>Operation lock</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={`${row.id.pool}:${row.id.txid}:${row.id.outputIndex}`} data-testid="note-row">
+              <td className="note-id">
+                {row.id.pool} {row.id.txid}:{row.id.outputIndex}
+                {row.address !== null && <span className="muted"> {row.address}</span>}
+              </td>
+              <td>{formatZats(row.value)}</td>
+              <td>{row.spendState}</td>
+              <td>{row.locked ? 'held' : '—'}</td>
+              <td>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => void (row.excluded ? app.onNotes.include(row.id) : app.onNotes.exclude(row.id))}
+                >
+                  {row.excluded ? 'Include' : 'Exclude'}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function WalletScreen() {
   const info = useStore(app.walletInfo);
   const balances = useStore(app.balances);
@@ -697,7 +779,9 @@ function WalletScreen() {
         <li>
           Ironwood <strong>{formatZats(balances?.ironwood ?? 0n)}</strong>
         </li>
+        <ExcludedCount />
       </ul>
+      <NotesBrowser />
       <ReceivePanel kind={info.kind} />
       <div className="actions">
         {gatePending ? (

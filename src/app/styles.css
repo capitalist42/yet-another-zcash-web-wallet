@@ -146,6 +146,29 @@ input[type='radio'] {
   border-radius: 8px;
   padding: 8px;
 }
+.balances li.excluded-count {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.notes {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.notes th,
+.notes td {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 4px;
+  text-align: left;
+  vertical-align: top;
+}
+.notes td.note-id {
+  word-break: break-all;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+}
 .address {
   word-break: break-all;
   background: #0f1115;

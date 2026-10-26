@@ -36,6 +36,7 @@ import type {
   EngineSeedAccount,
   EngineSendResult,
   EngineShieldArgs,
+  EngineNote,
   EngineSyncStatus,
   EngineTransactionOutput,
   EngineTransparentUtxo,
@@ -44,6 +45,23 @@ import type {
 } from './port';
 import { EngineError } from './port';
 import { frozenPolicy, RECOVERY_POLICY } from '../policy';
+
+/** Follow `nextCursor` until the page ends. A repeated cursor would loop
+ * forever, so it stops and returns the rows already collected. */
+const eachPage = async <T>(
+  fetch: (cursor: string | undefined) => Promise<{ items: readonly T[]; nextCursor: string | null }>,
+): Promise<T[]> => {
+  const out: T[] = [];
+  let cursor: string | undefined;
+  const seen = new Set<string>();
+  for (;;) {
+    const page = await fetch(cursor);
+    out.push(...page.items);
+    if (page.nextCursor === null || seen.has(page.nextCursor)) return out;
+    seen.add(page.nextCursor);
+    cursor = page.nextCursor;
+  }
+};
 
 const mapError = (e: unknown): EngineError => {
   if (e instanceof EngineError) return e;
@@ -118,7 +136,15 @@ const projectProposal = (proposal: Proposal): EngineProposal => ({
   steps: proposal.steps.map((step) => ({
     expiryHeight: step.expiryHeight,
     fee: step.fee,
-    inputs: step.inputs.map((input) => ({ pool: input.pool, value: input.value })),
+    inputs: step.inputs.map((input) => ({
+      pool: input.pool,
+      value: input.value,
+      // prior-step inputs fund a later transaction in the same plan; they are
+      // not notes the user can Exclude, so they carry no note id.
+      ...(input.source.kind === 'output'
+        ? { note: { pool: input.pool, txid: input.source.txid, outputIndex: input.source.outputIndex } }
+        : {}),
+    })),
     outputs: step.outputs.map((output) => ({
       kind: output.kind,
       pool: output.pool,
@@ -428,6 +454,46 @@ class AdapterWallet implements EngineWallet {
       return page.items
         .filter((u): u is typeof u & { address: string } => u.address !== null)
         .map((u) => ({ address: u.address, value: u.value }));
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  async listNotes(accountId: string): Promise<readonly EngineNote[]> {
+    try {
+      const items = await eachPage((cursor) =>
+        this.client.listNotes({
+          accountId: accountId as AccountId,
+          ...(cursor === undefined ? {} : { cursor }),
+        }),
+      );
+      return items.map((note) => ({
+        id: { pool: note.pool, txid: note.txid, outputIndex: note.outputIndex },
+        value: note.value,
+        spendState: note.spendState,
+        locked: note.lock !== null,
+        address: null,
+      }));
+    } catch (e) {
+      throw mapError(e);
+    }
+  }
+
+  async listUtxos(accountId: string): Promise<readonly EngineNote[]> {
+    try {
+      const items = await eachPage((cursor) =>
+        this.client.listUtxos({
+          accountId: accountId as AccountId,
+          ...(cursor === undefined ? {} : { cursor }),
+        }),
+      );
+      return items.map((utxo) => ({
+        id: { pool: 'transparent', txid: utxo.txid, outputIndex: utxo.outputIndex },
+        value: utxo.value,
+        spendState: utxo.spendState,
+        locked: utxo.lock !== null,
+        address: utxo.address,
+      }));
     } catch (e) {
       throw mapError(e);
     }

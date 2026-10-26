@@ -10,6 +10,7 @@ import type {
   EngineBirthdayHandle,
   EngineErrorCode,
   EngineHistoryEntry,
+  EngineNote,
   EngineOperation,
   EngineProposal,
   EngineProposeArgs,
@@ -51,8 +52,25 @@ export interface FakeAccountSpec {
    * scripts one mid-session (a sync tick then sees it in `history`). */
   transactions?: Record<string, EngineTransactionOutput[]>;
   /** Unspent transparent outputs for the Shield screen (issue #8); the app
-   * groups these by address for its checkbox list. */
-  utxos?: { address: string; value: bigint }[];
+   * groups these by address for its checkbox list. Optional identity fields
+   * feed the note browser; Shield only reads address and value. */
+  utxos?: {
+    address: string;
+    value: bigint;
+    txid?: string;
+    outputIndex?: number;
+    spendState?: EngineNote['spendState'];
+    locked?: boolean;
+  }[];
+  /** Shielded notes for the note browser and send-selection checks (issue #9). */
+  notes?: {
+    pool: 'sapling' | 'ironwood';
+    txid: string;
+    outputIndex: number;
+    value: bigint;
+    spendState?: EngineNote['spendState'];
+    locked?: boolean;
+  }[];
 }
 
 export interface FakeWalletSpec {
@@ -193,8 +211,13 @@ export class FakeWallet implements EngineWallet {
 
   /** Script the account's unspent transparent outputs (Shield screen,
    * issue #8). */
-  setUtxos(accountId: string, utxos: { address: string; value: bigint }[]): void {
+  setUtxos(accountId: string, utxos: NonNullable<FakeAccountSpec['utxos']>): void {
     this.need(accountId).utxos = utxos.map((u) => ({ ...u }));
+  }
+
+  /** Script shielded notes (issue #9). */
+  setNotes(accountId: string, notes: NonNullable<FakeAccountSpec['notes']>): void {
+    this.need(accountId).notes = notes.map((n) => ({ ...n }));
   }
 
   pushSync(status: EngineSyncStatus): void {
@@ -526,7 +549,29 @@ export class FakeWallet implements EngineWallet {
 
   async listTransparentUtxos(accountId: string): Promise<readonly EngineTransparentUtxo[]> {
     this.check('listTransparentUtxos');
-    return (this.need(accountId).utxos ?? []).map((u) => ({ ...u }));
+    return (this.need(accountId).utxos ?? []).map((u) => ({ address: u.address, value: u.value }));
+  }
+
+  async listNotes(accountId: string): Promise<readonly EngineNote[]> {
+    this.check('listNotes');
+    return (this.need(accountId).notes ?? []).map((n) => ({
+      id: { pool: n.pool, txid: n.txid, outputIndex: n.outputIndex },
+      value: n.value,
+      spendState: n.spendState ?? 'unspent',
+      locked: n.locked ?? false,
+      address: null,
+    }));
+  }
+
+  async listUtxos(accountId: string): Promise<readonly EngineNote[]> {
+    this.check('listUtxos');
+    return (this.need(accountId).utxos ?? []).map((u, i) => ({
+      id: { pool: 'transparent', txid: u.txid ?? `utxo-${i}`, outputIndex: u.outputIndex ?? i },
+      value: u.value,
+      spendState: u.spendState ?? 'unspent',
+      locked: u.locked ?? false,
+      address: u.address,
+    }));
   }
 
   async send(proposalId: string): Promise<EngineSendResult> {

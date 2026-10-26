@@ -11,12 +11,14 @@ import type {
   EngineBalance,
   EngineErrorCode,
   EngineHistoryEntry,
+  EngineNote,
   EngineProposal,
   EngineRecovery,
   EngineSyncStatus,
   EngineTransparentUtxo,
   EngineWallet,
   NetworkId,
+  NoteId,
 } from './engine/port';
 import { EngineError, isNonTerminal, MAX_SHIELD_ADDRESSES } from './engine/port';
 import type { Registry, WalletKind, WalletRecord } from './registry';
@@ -109,10 +111,24 @@ export type SendView =
       readonly draft: SendDraftView;
       readonly proposal: EngineProposal;
       readonly notice: SendNotice;
+      /** A chain input spends a note outside the non-excluded selection. */
+      readonly deviation: boolean;
+      /** The user accepted that real Proposal. Ignored when deviation is false. */
+      readonly accepted: boolean;
     }
   | { readonly phase: 'unlock'; readonly draft: SendDraftView; readonly notice: SendNotice }
   | { readonly phase: 'sync'; readonly draft: SendDraftView }
   | { readonly phase: 'sent'; readonly txid: string | null };
+
+/** One note-browser row. `locked` is the operation lock, not Exclude. */
+export interface NoteRow {
+  readonly id: NoteId;
+  readonly value: bigint;
+  readonly spendState: EngineNote['spendState'];
+  readonly locked: boolean;
+  readonly excluded: boolean;
+  readonly address: string | null;
+}
 
 /** One checkbox row of the Shield screen: ALL of one address's spendable
  * transparent utxos (the SDK's selection granularity is the address, so the
@@ -169,6 +185,10 @@ export interface WalletApp {
   readonly endpoint: ReadableAtom<string>;
   readonly walletInfo: ReadableAtom<WalletInfo | null>;
   readonly balances: ReadableAtom<EngineBalance | null>;
+  /** Size of this Wallet's persisted Exclude set (issue #9). */
+  readonly excludedCount: ReadableAtom<number>;
+  /** Note/UTXO browser. Spend state and operation lock are display-only. */
+  readonly notes: ReadableAtom<readonly NoteRow[]>;
   readonly sync: ReadableAtom<EngineSyncStatus | null>;
   /** `sync` + the scanned account's birthday height (percent denominator). */
   readonly syncProgress: ReadableAtom<SyncProgressView | null>;
@@ -248,12 +268,22 @@ export interface WalletApp {
     review(): Promise<void>;
     /** Broadcast the proposal currently on the review screen. */
     confirm(): Promise<void>;
+    /** Consent to a Proposal whose inputs fell outside the selection. */
+    acceptInputs(): void;
     /** Re-enter the seed phrase after a reattach-signer recovery. */
     unlock(phrase: string): Promise<void>;
     /** Leave the sync route and rebuild the payment. */
     backToForm(): void;
     /** Leave review without sending. The proposal is released. */
     edit(): void;
+  };
+  readonly onNotes: {
+    /** Re-read notes and UTXOs for the open Wallet. */
+    refresh(): Promise<void>;
+    exclude(id: NoteId): Promise<void>;
+    include(id: NoteId): Promise<void>;
+    /** Drop every Exclude on this Wallet. */
+    reset(): Promise<void>;
   };
   readonly shield: ReadableAtom<ShieldView>;
   readonly onShield: {
@@ -463,6 +493,34 @@ export const networkFromQuery = (): NetworkId | null => {
   return forced === 'mainnet' || forced === 'testnet' ? forced : null;
 };
 
+const noteKey = (note: NoteId): string => `${note.pool}:${note.txid}:${note.outputIndex}`;
+
+const sameNote = (a: NoteId, b: NoteId): boolean =>
+  a.pool === b.pool && a.txid === b.txid && a.outputIndex === b.outputIndex;
+
+/** Unspent notes the user has not Excluded. Transparent notes stay out while
+ * transparent sends are off — the Send screen already refuses those inputs. */
+const allowedNoteKeys = (inventory: readonly EngineNote[], excludedIds: readonly NoteId[]): Set<string> => {
+  const blocked = new Set(excludedIds.map(noteKey));
+  const allowed = new Set<string>();
+  for (const note of inventory) {
+    if (note.spendState !== 'unspent') continue;
+    if (!ALLOW_TRANSPARENT_SENDS && note.id.pool === 'transparent') continue;
+    const key = noteKey(note.id);
+    if (blocked.has(key)) continue;
+    allowed.add(key);
+  }
+  return allowed;
+};
+
+/** True when a chain input spends a note outside the selection. The SDK has
+ * no forced-inputs API, so this is the check instead of a selector argument.
+ * A prior-step input has no note id and is not a user note. */
+const proposalDeviates = (proposal: EngineProposal, allowed: ReadonlySet<string>): boolean =>
+  proposal.steps.some((step) =>
+    step.inputs.some((input) => input.note !== undefined && !allowed.has(noteKey(input.note))),
+  );
+
 export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const screen = atom<Screen>('booting');
   const network = atom<NetworkId>(networkFromQuery() ?? 'mainnet');
@@ -484,6 +542,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const shield = atom<ShieldView>({ phase: 'closed' });
   /** Mandatory Exposed Address list (ADR-0004); rebuilt by observeHistory. */
   const exposedAddresses = atom<readonly ExposedAddress[]>([]);
+  /** Exclude set for the open Wallet. The registry row is the durable copy. */
+  const excluded = atom<readonly NoteId[]>([]);
+  const excludedCount = computed(excluded, (list) => list.length);
+  const notes = atom<readonly NoteRow[]>([]);
 
   // --- Session/Lock atoms (issue #6) --------------------------------------
   const unlocked = atom<boolean>(false);
@@ -497,6 +559,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   let wallet: EngineWallet | null = null;
   /** Proposal the review screen is holding. send() uses this id and no other. */
   let held: EngineProposal | null = null;
+  /** Whether `held` spends outside the selection, and whether that was accepted. */
+  let heldDeviation = false;
+  let heldAccepted = false;
   let openSeq = 0;
   let createPhrase: string | null = null;
   let backupConfirmed = false;
@@ -527,6 +592,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     canSpend.set(false);
     bootError.set(null);
     held = null;
+    heldDeviation = false;
+    heldAccepted = false;
+    excluded.set([]);
+    notes.set([]);
     send.set({ phase: 'closed' });
     unlocked.set(false);
     unlockDeadline.set(null);
@@ -539,6 +608,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     stopAutoLock();
     const op = held?.operationId ?? null;
     held = null;
+    heldDeviation = false;
+    heldAccepted = false;
     send.set({ phase: 'closed' });
     const w = wallet;
     wallet = null;
@@ -550,6 +621,78 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   /** v1 rule: one default account per Wallet; switcher UI is #11. */
   const defaultAccount = async (w: EngineWallet): Promise<EngineAccount | undefined> =>
     (await w.accounts())[0];
+
+  const paintNotes = (inventory: readonly EngineNote[]): void => {
+    const ids = excluded.get();
+    notes.set(
+      inventory.map((note) => ({
+        id: note.id,
+        value: note.value,
+        spendState: note.spendState,
+        locked: note.locked,
+        address: note.address,
+        excluded: ids.some((id) => sameNote(id, note.id)),
+      })),
+    );
+  };
+
+  /** Re-read inventory. A failed read leaves the previous rows; the count
+   * still comes from the registry, not from this list. */
+  const refreshNotes = async (w: EngineWallet, accountId: string): Promise<void> => {
+    try {
+      const [shielded, utxos] = await Promise.all([w.listNotes(accountId), w.listUtxos(accountId)]);
+      if (wallet !== w) return;
+      paintNotes([...shielded, ...utxos]);
+    } catch {
+      // stale inventory; Exclude count is independent of this read
+    }
+  };
+
+  const writeExcluded = async (next: readonly NoteId[]): Promise<void> => {
+    const info = walletInfo.get();
+    if (info === null) return;
+    excluded.set(next);
+    notes.set(notes.get().map((row) => ({ ...row, excluded: next.some((id) => sameNote(id, row.id)) })));
+    const rec = await deps.registry.get(info.id);
+    if (rec === null) return;
+    await deps.registry.add({ ...rec, excludedNotes: next });
+  };
+
+  const onNotes = {
+    async refresh(): Promise<void> {
+      if (wallet === null) return;
+      const account = await defaultAccount(wallet);
+      if (account === undefined) return;
+      await refreshNotes(wallet, account.id);
+    },
+    async exclude(id: NoteId): Promise<void> {
+      if (excluded.get().some((note) => sameNote(note, id))) return;
+      await writeExcluded([...excluded.get(), id]);
+    },
+    async include(id: NoteId): Promise<void> {
+      await writeExcluded(excluded.get().filter((note) => !sameNote(note, id)));
+    },
+    async reset(): Promise<void> {
+      await writeExcluded([]);
+    },
+  };
+
+  /** Identified inputs outside the current unspent, non-excluded selection.
+   * Inventory failure fails closed: every identified input is a deviation. */
+  const selectionDeviates = async (
+    w: EngineWallet,
+    accountId: string,
+    proposal: EngineProposal,
+  ): Promise<boolean> => {
+    let inventory: readonly EngineNote[] = [];
+    try {
+      const [shielded, utxos] = await Promise.all([w.listNotes(accountId), w.listUtxos(accountId)]);
+      inventory = [...shielded, ...utxos];
+    } catch {
+      inventory = [];
+    }
+    return proposalDeviates(proposal, allowedNoteKeys(inventory, excluded.get()));
+  };
 
   const refreshOperations = async (): Promise<void> => {
     if (wallet === null) return;
@@ -649,6 +792,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           // transfers; one landing on the displayed address advances it
           // exactly once (observedTxids dedupe).
           await observeHistory(w, account);
+          await refreshNotes(w, account.id);
         }
       }
     } catch {
@@ -739,6 +883,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       fingerprint: record.fingerprint,
       kind: record.kind,
     });
+    excluded.set(record.excludedNotes ?? []);
     canSpend.set(false); // set below after the session check decides unlocked
     const account = await defaultAccount(w);
     if (account !== undefined) {
@@ -762,6 +907,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       // second index for the same transfer. Deeper than a tick's 20: a
       // payment received while closed need not be inside the newest 20.
       await observeHistory(w, account, 100);
+      await refreshNotes(w, account.id);
       await refreshOperations();
     }
     // Subscribe BEFORE triggering sync: the SDK stream only publishes on
@@ -1259,6 +1405,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         fingerprint: prior?.fingerprint ?? '',
         kind: 'seed',
         lastUsed: Date.now(),
+        excludedNotes: prior?.excludedNotes ?? [],
       });
       if (phrase !== '') savePendingSeed(choice ?? pendingChoice ?? { remember: false }, { id, phrase });
       // A network switch that landed while open() was in flight owns the screen.
@@ -1291,6 +1438,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         fingerprint,
         kind: 'seed',
         lastUsed: Date.now(),
+        excludedNotes: (await deps.registry.get(id))?.excludedNotes ?? [],
       };
       await deps.registry.add(record);
       clearPendingSeed();
@@ -1510,6 +1658,17 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     send.set({ phase: 'form', draft: draftView(draft), notice });
   };
 
+  const showReview = (draft: Draft, proposal: EngineProposal, notice: SendNotice): void => {
+    send.set({
+      phase: 'review',
+      draft: draftView(draft),
+      proposal,
+      notice,
+      deviation: heldDeviation,
+      accepted: heldAccepted,
+    });
+  };
+
   const readDraft = (view: { readonly draft: SendDraftView }): Draft => ({
     recipient: view.draft.recipient,
     amount: view.draft.amount,
@@ -1524,6 +1683,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     const op = held?.operationId ?? null;
     const current = wallet;
     held = null;
+    heldDeviation = false;
+    heldAccepted = false;
     if (op === null || current === null) return releaseTail;
     const run = (): Promise<void> => {
       releasesInFlight += 1;
@@ -1603,7 +1764,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     }
     const engineNotice: SendNotice = { kind: 'engine', code: error.code, recovery: error.recovery };
     if (keepProposal && held !== null) {
-      send.set({ phase: 'review', draft: draftView(draft), proposal: held, notice: engineNotice });
+      showReview(draft, held, engineNotice);
       return;
     }
     showForm(draft, engineNotice);
@@ -1701,7 +1862,30 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           return;
         }
         held = proposal;
-        send.set({ phase: 'review', draft: draftView(draft), proposal, notice: null });
+        // The engine picked inputs on its own. If one is Excluded (or otherwise
+        // outside the selection), the review shows that real plan and confirm
+        // waits for an explicit accept. Inventory is read after propose; if the
+        // user left or edited the draft during that read, drop the plan instead
+        // of painting a review they already dismissed.
+        const deviates = await selectionDeviates(wallet, account.id, proposal);
+        if (held !== proposal) return;
+        const current = send.get();
+        if (current.phase !== 'form' && current.phase !== 'review') {
+          await releaseHeld();
+          return;
+        }
+        const currentDraft = readDraft(current);
+        if (
+          currentDraft.recipient !== draft.recipient
+          || currentDraft.amount !== draft.amount
+          || currentDraft.memo !== draft.memo
+        ) {
+          await releaseHeld();
+          return;
+        }
+        heldDeviation = deviates;
+        heldAccepted = false;
+        showReview(draft, proposal, null);
       } catch (error) {
         await routeEngine(error, draft, false);
       }
@@ -1709,12 +1893,16 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     async confirm(): Promise<void> {
       const view = send.get();
       if (view.phase !== 'review' || held === null || wallet === null) return;
+      // A deviant plan is not consent. The user has to accept the real inputs.
+      if (view.deviation && !view.accepted) return;
       const draft = readDraft(view);
       // Broadcasting is a spend attempt → activity (issue #6).
       touchIdle();
       try {
         const result = await wallet.send(held.proposalId);
         held = null;
+        heldDeviation = false;
+        heldAccepted = false;
         await refreshOperations();
         send.set({ phase: 'sent', txid: result.txid });
       } catch (error) {
@@ -1752,7 +1940,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         canSpend.set(true);
         startAutoLock();
         touchIdle();
-        if (held !== null) send.set({ phase: 'review', draft: draftView(draft), proposal: held, notice: null });
+        if (held !== null) showReview(draft, held, null);
         else showForm(draft, null);
       } catch (error) {
         await routeEngine(error, draft, held !== null);
@@ -1771,6 +1959,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       if (view.phase !== 'review') return;
       void releaseHeld();
       showForm(readDraft(view), null);
+    },
+        acceptInputs(): void {
+      const view = send.get();
+      if (view.phase !== 'review' || !view.deviation || view.accepted || held === null) return;
+      heldAccepted = true;
+      send.set({ ...view, accepted: true });
     },
   };
 
@@ -2052,6 +2246,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     endpoint,
     walletInfo,
     balances,
+    excludedCount,
+    notes,
     sync,
     syncProgress,
     address,
@@ -2080,6 +2276,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     unlockWithPhrase,
     send,
     onSend,
+    onNotes,
     shield,
     onShield,
     async history(): Promise<readonly EngineHistoryEntry[]> {
