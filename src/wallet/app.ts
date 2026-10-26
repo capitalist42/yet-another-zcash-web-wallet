@@ -1898,6 +1898,17 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       // A deviant plan is not consent. The user has to accept the real inputs.
       if (view.deviation && !view.accepted) return;
       const draft = readDraft(view);
+      const guard = spendGuard();
+      if (!guard.ok) {
+        // Lock already dropped spend authority. Release the plan so its
+        // inputs are not stuck, and do not broadcast.
+        await releaseHeld();
+        showForm(
+          draft,
+          { kind: guard.reason === 'view-only' ? 'view-only' : guard.reason === 'locked' ? 'locked' : 'unavailable' },
+        );
+        return;
+      }
       // Broadcasting is a spend attempt → activity (issue #6).
       touchIdle();
       try {

@@ -157,6 +157,20 @@ describe('proposal review', () => {
     expect(wallet.sentProposalIds).toEqual([]);
     expect(wallet.abandoned).toEqual(['op-reviewed']);
   });
+
+  it('does not broadcast a reviewed send once Lock has started', async () => {
+    await openSeed();
+    const wallet = engine.lastWallet();
+    wallet.queueProposal(REVIEWED, 'cafe');
+    fill();
+    await app.onSend.review();
+    expect(app.send.get().phase).toBe('review');
+    app.lock();
+    await app.onSend.confirm();
+    expect(wallet.sentProposalIds).toEqual([]);
+    expect(wallet.abandoned).toEqual(['op-reviewed']);
+    expect(app.send.get()).toMatchObject({ phase: 'form', notice: { kind: 'locked' } });
+  });
 });
 
 describe('send error recovery', () => {
