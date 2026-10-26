@@ -75,7 +75,7 @@ afterEach(() => {
 
 const createRemember = async (passphrase: string): Promise<string> => {
   const created = await app.onCreate.generate();
-  const res = await app.onCreate.confirmBackup(created.phrase, { remember: true, vaultPassphrase: passphrase });
+  const res = await app.onCreate.confirmBackup(created.phrase, { kind: 'passphrase', vaultPassphrase: passphrase });
   if (!res.ok) throw new Error(`create failed: ${res.code} ${res.message}`);
   return created.phrase;
 };
@@ -167,7 +167,7 @@ describe('unlock with passphrase (acceptance #3)', () => {
 
   it('unlock on a Never-store wallet: no vault entry → NOT_FOUND, phrase path required', async () => {
     const created = await app.onCreate.generate();
-    const res = await app.onCreate.confirmBackup(created.phrase, { remember: false });
+    const res = await app.onCreate.confirmBackup(created.phrase, { kind: 'never' });
     expect(res.ok).toBe(true);
     expect(await vault.has((await registry.list('testnet'))[0]!.id)).toBe(false);
     await app.lock();
@@ -180,7 +180,7 @@ describe('unlock with passphrase (acceptance #3)', () => {
     // the fake models the SDK's check of the restored key against the stored
     // viewing key, so a foreign-but-valid phrase must be rejected.
     const created = await app.onCreate.generate();
-    await app.onCreate.confirmBackup(created.phrase, { remember: false });
+    await app.onCreate.confirmBackup(created.phrase, { kind: 'never' });
     await app.lock();
     const res = await app.unlockWithPhrase(FUNDED_PHRASE);
     expect(res.ok).toBe(false);
@@ -319,5 +319,31 @@ describe('custody choice survives a reload mid-create', () => {
     expect((await registry.get('pend'))?.fingerprint).toMatch(/^[a-z2-7]{4}$/);
     expect(await vault.has('pend')).toBe(true);
     expect(app.unlocked.get()).toBe(true);
+  });
+});
+
+describe('restore stores encrypted on this device', () => {
+  it('writes a device envelope and unlocks after Lock without a vault passphrase', async () => {
+    const res = await app.onRestore.restore({ phrase: FUNDED_PHRASE, accountIndex: 0, birthday: 'fullScan' });
+    expect(res.ok).toBe(true);
+    const id = (await registry.list('testnet'))[0]!.id;
+    expect(await vault.deviceBound(id)).toBe(true);
+    expect(app.hasVault.get()).toBe(true);
+    expect(app.deviceVault.get()).toBe(true);
+    expect(app.unlocked.get()).toBe(true);
+    await app.lock();
+    const refused = await app.unlock('vaultpw');
+    expect(refused).toMatchObject({ ok: false, code: 'INVALID_ARGUMENT' });
+    expect(app.unlocked.get()).toBe(false);
+    engine.lastWallet().closed = true;
+    engine.queueWallet({ accounts: [{ id: 'acct-1' }] });
+    await app.boot();
+    expect(app.deviceVault.get()).toBe(true);
+    expect(app.unlocked.get()).toBe(false);
+    const unlocked = await app.unlockStored();
+    expect(unlocked.ok).toBe(true);
+    expect(app.unlocked.get()).toBe(true);
+    const fed = new TextDecoder().decode(engine.lastWallet().attachArgs.at(-1)!.mnemonic);
+    expect(fed).toBe(FUNDED_PHRASE);
   });
 });

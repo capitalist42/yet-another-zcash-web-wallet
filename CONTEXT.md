@@ -22,13 +22,13 @@ _Avoid_: connection, session
 Mainnet or Testnet. Each network has its own Wallets, storage, and endpoint settings.
 
 **Vault**:
-The app-level, user-passphrase-encrypted store of a Wallet's seed (AES-GCM envelope in IndexedDB). Holds spend authority; the SDK's own DB never does.
+The app-level encrypted store of a Wallet's seed (AES-GCM envelope in IndexedDB). Create keys it with a user passphrase. Restore keys it with a device-local key and does not ask for a vault passphrase. Holds spend authority; the SDK's own DB never does.
 _Avoid_: keystore, keychain
 
 ### Session
 
 **Unlock**:
-Entering the Vault passphrase to load spend authority into memory (`attachSigner`).
+Loading spend authority into memory (`attachSigner`). A user-passphrase Vault asks for that passphrase. A device-stored restore wallet unlocks without one.
 _Avoid_: login, sign in
 
 **Lock**:

@@ -72,13 +72,13 @@ export interface SpendGuard {
   readonly reason?: 'view-only' | 'unavailable' | 'locked';
 }
 
-/** Onboarding custody choice (ADR-0002, issue #6): at create/restore the user
- * picks "Remember on this device (encrypted)" or "Never store". `vaultPassphrase`
- * is required when `remember` is true (the AES-GCM envelope key). */
-export interface RememberChoice {
-  readonly remember: boolean;
-  readonly vaultPassphrase?: string;
-}
+/** Onboarding custody (ADR-0002). Create picks a user-passphrase envelope or
+ * never storing the seed. Restore always uses `device`: AES-GCM on this
+ * device, no vault passphrase. */
+export type RememberChoice =
+  | { readonly kind: 'never' }
+  | { readonly kind: 'passphrase'; readonly vaultPassphrase: string }
+  | { readonly kind: 'device' };
 
 export interface SendDraftView {
   readonly recipient: string;
@@ -229,6 +229,9 @@ export interface WalletApp {
   /** True when a Vault envelope exists for the open Wallet (Remember). False
    * for view-only and Never-store Wallets — Unlock uses the phrase path. */
   readonly hasVault: ReadableAtom<boolean>;
+  /** True when that envelope is the restore device key. Unlock confirms; it
+   * does not ask for a passphrase. */
+  readonly deviceVault: ReadableAtom<boolean>;
   /** Forced backup gate is open: a generated phrase awaits confirmation.
    * While true, every other onboarding path is refused (#4: not dismissable). */
   readonly backupPending: ReadableAtom<boolean>;
@@ -279,6 +282,8 @@ export interface WalletApp {
    * phrase (Never-store). On success, the signer is attached and the seed
    * mirror + idle deadline persist (Remember only). Never auto-decrypts. */
   unlock(passphrase: string): Promise<ImportResult>;
+  /** Unlock a device-stored restore wallet. No passphrase. */
+  unlockStored(): Promise<ImportResult>;
   /** App-wide Lock (#6): detach the signer, zeroize the mirror, set the Lock
    * flag. Viewing continues; both Networks and every open Wallet lose spend
    * authority. The flag survives reload until the next Unlock clears it. */
@@ -410,7 +415,10 @@ const savePendingSeed = (choice: RememberChoice, seed: { id: string; phrase: str
   try {
     globalThis.sessionStorage?.setItem(
       PENDING_SEED_KEY,
-      JSON.stringify({ ...seed, ...(choice.remember && choice.vaultPassphrase !== undefined ? { remember: true, vaultPassphrase: choice.vaultPassphrase } : {}) }),
+      JSON.stringify({
+        ...seed,
+        ...(choice.kind === 'passphrase' ? { remember: true, vaultPassphrase: choice.vaultPassphrase } : {}),
+      }),
     );
   } catch {
     // Reload can only finish creation when the tab can hold the phrase.
@@ -426,7 +434,9 @@ const readPendingSeed = (): PendingSeed | null => {
     return {
       id: parsed.id,
       phrase: parsed.phrase,
-      ...(parsed.remember === true && typeof parsed.vaultPassphrase === 'string' ? { remember: true, vaultPassphrase: parsed.vaultPassphrase } : {}),
+      ...(parsed.remember === true && typeof parsed.vaultPassphrase === 'string'
+        ? { remember: true as const, vaultPassphrase: parsed.vaultPassphrase }
+        : {}),
     };
   } catch {
     return null;
@@ -587,6 +597,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const unlocked = atom<boolean>(false);
   const unlockDeadline = atom<number | null>(null);
   const hasVault = atom<boolean>(false);
+  const deviceVault = atom<boolean>(false);
   /** Ms remaining until auto-Lock; recomputed every tick (countdown chip). */
   const autoLockInMs = atom<number | null>(null);
 
@@ -639,6 +650,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     unlockDeadline.set(null);
     autoLockInMs.set(null);
     hasVault.set(false);
+    deviceVault.set(false);
   };
 
   const closeWallet = async (): Promise<void> => {
@@ -1318,9 +1330,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     // envelope re-store is idempotent.
     const storedChoice: RememberChoice | null =
       pending.remember === true && pending.vaultPassphrase !== undefined
-        ? { remember: true, vaultPassphrase: pending.vaultPassphrase }
+        ? { kind: 'passphrase', vaultPassphrase: pending.vaultPassphrase }
         : null;
-    const choice: RememberChoice = pendingChoice ?? storedChoice ?? { remember: await deps.vault.has(record.id) };
+    // No passphrase in this tab means we cannot re-key an envelope. A vault
+    // row that already exists is left as-is; this resume does not pretend
+    // the choice was Remember without the key.
+    const choice: RememberChoice = pendingChoice ?? storedChoice ?? { kind: 'never' };
     const bytes = phraseBytes(pending.phrase);
     traceSecret(bytes);
     try {
@@ -1340,8 +1355,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     unlockDeadline.set(null);
     autoLockInMs.set(null);
     hasVault.set(false);
+    deviceVault.set(false);
     if (record.kind !== 'seed') return; // view-only: no Unlock machinery
     hasVault.set(await deps.vault.has(record.id));
+    deviceVault.set(await deps.vault.deviceBound(record.id));
     const locked = readLockFlag();
     const mirror = readMirror();
     const now = Date.now();
@@ -1426,13 +1443,33 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     startAutoLock();
   };
 
-  /** Unlock via the Vault passphrase (Remember path). Decrypts the envelope,
-   * verifies the phrase by attaching the signer (the SDK checks it against
-   * the stored viewing key), mirrors the seed, and clears the Lock flag. */
+  const openFromPhrase = async (w: EngineWallet, accountId: string, infoId: string, phrase: string): Promise<ImportResult> => {
+    const bytes = phraseBytes(phrase);
+    traceSecret(bytes);
+    try {
+      await w.attachSigner({ accountId, mnemonic: bytes });
+      markUnlocked(infoId, phrase);
+      return { ok: true };
+    } catch (e) {
+      return asResult(e);
+    } finally {
+      zeroize(bytes);
+    }
+  };
+
+  /** Unlock via the Vault passphrase (create Remember path). Decrypts the
+   * envelope, verifies the phrase by attaching the signer (the SDK checks it
+   * against the stored viewing key), mirrors the seed, and clears the Lock flag. */
   const unlock = async (passphrase: string): Promise<ImportResult> => {
     const target = await unlockTarget();
     if (target === null) return { ok: false, code: 'UNKNOWN', message: 'no open seed Wallet' };
     const { w, info, account } = target;
+    if (await deps.vault.deviceBound(info.id))
+      return {
+        ok: false,
+        code: 'INVALID_ARGUMENT',
+        message: 'This wallet is stored on this device. Unlock does not take a passphrase.',
+      };
     let phrase: string;
     try {
       phrase = await deps.vault.load(info.id, passphrase);
@@ -1440,17 +1477,22 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       const code: VaultErrorCode = e instanceof VaultError ? e.code : 'UNKNOWN';
       return { ok: false, code, message: e instanceof Error ? e.message : String(e) };
     }
-    const bytes = phraseBytes(phrase);
-    traceSecret(bytes);
+    return openFromPhrase(w, account.id, info.id, phrase);
+  };
+
+  /** Unlock a restore wallet whose seed is encrypted on this device. */
+  const unlockStored = async (): Promise<ImportResult> => {
+    const target = await unlockTarget();
+    if (target === null) return { ok: false, code: 'UNKNOWN', message: 'no open seed Wallet' };
+    const { w, info, account } = target;
+    let phrase: string;
     try {
-      await w.attachSigner({ accountId: account.id, mnemonic: bytes });
-      markUnlocked(info.id, phrase);
-      return { ok: true };
+      phrase = await deps.vault.loadDevice(info.id);
     } catch (e) {
-      return asResult(e);
-    } finally {
-      zeroize(bytes);
+      const code: VaultErrorCode = e instanceof VaultError ? e.code : 'UNKNOWN';
+      return { ok: false, code, message: e instanceof Error ? e.message : String(e) };
     }
+    return openFromPhrase(w, account.id, info.id, phrase);
   };
 
   /** Unlock by re-entering the recovery phrase (Never-store path; no Vault
@@ -1490,12 +1532,14 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     traceSecret(bytes);
     try {
       await w.attachSigner({ accountId: account.id, mnemonic: bytes });
-      const remember = choice !== null && choice.remember && choice.vaultPassphrase !== undefined && choice.vaultPassphrase !== '';
-      if (remember && choice !== null && choice.vaultPassphrase !== undefined) {
-        await deps.vault.store(info.id, phrase, choice.vaultPassphrase);
-      }
-      hasVault.set(remember);
-      markUnlocked(info.id, remember ? phrase : null);
+      const device = choice?.kind === 'device';
+      const passphrase = choice?.kind === 'passphrase' && choice.vaultPassphrase !== '' ? choice.vaultPassphrase : null;
+      if (device) await deps.vault.storeDevice(info.id, phrase);
+      else if (passphrase !== null) await deps.vault.store(info.id, phrase, passphrase);
+      const stored = device || passphrase !== null;
+      hasVault.set(stored);
+      deviceVault.set(device);
+      markUnlocked(info.id, stored ? phrase : null);
     } catch {
       // best-effort: a failed attach after create leaves the wallet locked;
       // the user can Unlock with the passphrase (Remember) or phrase (Never).
@@ -1533,7 +1577,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         lastUsed: Date.now(),
         excludedNotes: prior?.excludedNotes ?? [],
       });
-      if (phrase !== '') savePendingSeed(choice ?? pendingChoice ?? { remember: false }, { id, phrase });
+      if (phrase !== '') savePendingSeed(choice ?? pendingChoice ?? { kind: 'never' }, { id, phrase });
       // A network switch that landed while open() was in flight owns the screen.
       const ownsScreen = seq === openSeq && (wallet === null || wallet === w);
       if (ownsScreen) {
@@ -1640,7 +1684,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     async confirmBackup(phrase: string, choice?: RememberChoice): Promise<ImportResult> {
       if (backupConfirmed) return { ok: true }; // idempotent double-tap
       if (createPhrase === null) return { ok: false, code: 'UNKNOWN', message: 'no phrase in flight' };
-      if (choice?.remember === true && (choice.vaultPassphrase === undefined || choice.vaultPassphrase === ''))
+      if (choice?.kind === 'passphrase' && choice.vaultPassphrase === '')
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Remember on this device requires a passphrase' };
       let normalized: string;
       try {
@@ -1651,7 +1695,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       if (normalized !== createPhrase) {
         return { ok: false, code: 'INVALID_MNEMONIC', message: 'phrase mismatch' };
       }
-      pendingChoice = choice ?? { remember: false };
+      pendingChoice = choice ?? { kind: 'never' };
       const bytes = phraseBytes(normalized);
       traceSecret(bytes);
       try {
@@ -1689,7 +1733,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Account index must be a whole number ≥ 0' };
       if (!validBirthday(args.birthday))
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Birthday height must be a whole number ≥ 1' };
-      if (args.custody?.remember === true && (args.custody.vaultPassphrase === undefined || args.custody.vaultPassphrase === ''))
+      if (args.custody?.kind === 'passphrase' && args.custody.vaultPassphrase === '')
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Remember on this device requires a passphrase' };
       let phrase: string;
       try {
@@ -1698,7 +1742,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         return { ok: false, code: 'INVALID_MNEMONIC', message: e instanceof Error ? e.message : String(e) };
       }
       const name = args.name ?? 'restored';
-      const choice: RememberChoice = args.custody ?? { remember: false };
+      const choice: RememberChoice = args.custody ?? { kind: 'device' };
       const bytes = phraseBytes(phrase);
       const pass = args.passphrase === undefined || args.passphrase === '' ? undefined : phraseBytes(args.passphrase);
       traceSecret(bytes);
@@ -2388,6 +2432,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     unlockDeadline,
     autoLockInMs,
     hasVault,
+    deviceVault,
     backupPending,
     creating,
     bootError,
@@ -2405,6 +2450,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     onViewOnly,
     guardSpend: spendGuard,
     unlock,
+    unlockStored,
     lock,
     unlockWithPhrase,
     send,
