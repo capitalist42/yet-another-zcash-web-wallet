@@ -197,8 +197,8 @@ async function driveSendForm() {
 // =============================================================================
 // create-wallet — features/create-wallet.md
 // welcome -> Create -> forced backup gate (24 words shown, 3 random positions
-// quizzed; wrong words rejected, right words open the engine) -> wallet screen (or, on testnet, the honest
-// SYNC_REQUIRED) -> second tab storage-busy -> reload boots straight back.
+// quizzed; wrong words rejected, right words open the engine) -> wallet screen
+// on BOTH networks (pinned NU7 fork) -> second tab storage-busy -> reload boots straight back.
 // =============================================================================
 async function driveCreateWallet() {
   let fpBefore = ''; // fingerprint chip observed before reload; equality proves same wallet
@@ -259,9 +259,10 @@ async function driveCreateWallet() {
     log('gate confirmed; waiting for wallet screen (wasm + OPFS + lightd)…');
   });
 
-  // Either the wallet screen appears, or an honest error does. mainnet must
-  // land on the wallet; testnet MUST land on the honest SYNC_REQUIRED while
-  // the rc.5 codec tops out below NU7 (docs/manual-verification.md NO-GO).
+  // Both networks must land on the wallet screen: the pinned fork of
+  // rc.5 selects the NU7 consensus branch at activation, so a fresh testnet
+  // create opens, scans to tip, and completes. An honest error here is a
+  // real fault, not the old NO-GO premise.
   const outcome = await step('engine-open-outcome', async () => {
     const race = await Promise.race([
       page.waitForSelector('[aria-label="wallet"]', { timeout: 240_000 }).then(() => 'wallet'),
@@ -276,23 +277,6 @@ async function driveCreateWallet() {
         )
         .then(() => 'error'),
     ]).catch(() => 'timeout');
-    const bodyText = await page.textContent('body');
-    if (network === 'testnet') {
-      if (race !== 'error') throw new Error(`testnet leg expected the honest error path, got "${race}" (was the codec/NO-GO expectation updated?)`);
-      const err = (await page.textContent('.error')).trim();
-      // the UI renders EngineError.message — for SYNC_REQUIRED the SDK's text
-      // is "Sync the wallet before continuing; retain any existing payment operation."
-      if (!/SYNC_REQUIRED|Sync the wallet before continuing/i.test(err + bodyText))
-        throw new Error(`testnet error is not the honest sync failure: "${err}"`);
-      // SYNC_REQUIRED is a pause, not a dead end: the retry screen explains the
-      // pause and offers Try again / Switch to Mainnet / Back to my phrase.
-      await page.waitForSelector('[aria-label="sync retry"]', { timeout: 5_000 });
-      if (!(await page.isVisible('text=Try again')) || !(await page.isVisible('text=Back to my recovery phrase')))
-        throw new Error('sync-retry screen missing its recovery actions');
-      await page.click('text=Back to my recovery phrase');
-      await page.waitForSelector('[aria-label="backup gate"]', { timeout: 5_000 });
-      return `honest testnet failure with working retry screen: "${err.slice(0, 160)}"`;
-    }
     if (race !== 'wallet') {
       const err = await page
         .textContent('.error')
@@ -304,7 +288,7 @@ async function driveCreateWallet() {
   });
   await snap('after-open');
 
-  if (outcome !== undefined && network === 'mainnet') {
+  if (outcome !== undefined) {
     await step('wallet-screen-state', async () => {
       const net = await page.getAttribute('main.app', 'data-network');
       if (net !== network) throw new Error(`data-network flipped to "${net}"`);
@@ -328,7 +312,7 @@ async function driveCreateWallet() {
       });
       fpBefore = fp;
       const addr = (await page.textContent('[data-testid="receive-address"]')).trim();
-      const send = page.locator('[aria-label="wallet"] .actions > button', { hasText: 'Send' });
+      const send = page.locator('[aria-label="wallet"] .actions button', { hasText: 'Send' });
       const disabled = await send.getAttribute('disabled');
       if (disabled !== null) throw new Error(`Send should be available on a seed wallet (disabled=${disabled})`);
       await send.click();

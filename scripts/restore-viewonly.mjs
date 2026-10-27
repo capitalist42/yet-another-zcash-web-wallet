@@ -57,7 +57,9 @@ if (!MNEMONIC || EXPECT === undefined || EXPECT === null) {
   process.exit(2);
 }
 const network = process.argv[2] ?? 'testnet';
-const APP = `http://127.0.0.1:4173/?network=${network}`;
+// Same rule as the verify skill: port 4173 may belong to a human's preview;
+// point this leg at a run-specific one with ZCASH_VERIFY_PORT.
+const APP = `http://127.0.0.1:${process.env.ZCASH_VERIFY_PORT ?? 4173}/?network=${network}`;
 const ZEC = 100_000_000n;
 const zats = (s) => {
   const t = String(s).trim();

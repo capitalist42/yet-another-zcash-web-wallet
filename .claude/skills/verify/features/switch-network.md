@@ -23,7 +23,7 @@ Preconditions:
 - **Switch away.** Click it. Boot text `Loading your Wallet…` may flash; settle on `[aria-label="welcome"]` (testnet registry empty on this profile) with `main.app` `data-network="testnet"`. ≤60 s. Snapshot.
 - **Isolation proof.** Welcome, not the old wallet: the mainnet wallet's name/fingerprint is nowhere on the testnet welcome screen.
 - **Return via boot.** The toggle lives on the wallet screen, and welcome has none — so switching back goes through a reload: navigate `<base>/?network=mainnet` (registry row present ⇒ boot goes straight to `[aria-label="wallet"]`, ≤120 s) and assert the ORIGINAL fingerprint chip. This proves both isolation-flip-back and boot-from-registry; the header button again reads `Switch to testnet`.
-- **Both sides populated (stretch).** After also having a testnet wallet (currently blocked by the NU7 NO-GO — record as blocked), toggling back and forth must alternate fingerprints in ≤60 s each way with zero page errors, and each side keeps its own balances/history.
+- **Both sides populated (stretch).** After also having a testnet wallet, toggling back and forth must alternate fingerprints in ≤60 s each way with zero page errors, and each side keeps its own balances/history.
 
 Not implemented in run.mjs yet — hand-drive per SKILL.md *Drive* until added.
 

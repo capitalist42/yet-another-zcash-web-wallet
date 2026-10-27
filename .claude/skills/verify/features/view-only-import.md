@@ -18,7 +18,7 @@ View-only import registers a Wallet from a Unified Full Viewing Key: the user se
 
 Preconditions:
 
-- A valid mainnet UFVK belonging to a funded account is an OPERATOR precondition — `docs/manual-verification.md` lists the real-funded check as open; there is no scripted source of mainnet funds. Supply via `ZCASH_VERIFY_UFVK` env. A `derive-testnet-address.mjs`-style UFVK works for import-and-render on testnet only if the endpoint leg itself passes — it currently cannot (NU7 NO-GO), so on testnet expect the honest `SYNC_REQUIRED` instead.
+- A valid mainnet UFVK belonging to a funded account is an OPERATOR precondition — `docs/manual-verification.md` lists the real-funded check as open; there is no scripted source of mainnet funds. Supply via `ZCASH_VERIFY_UFVK` env. On testnet the pinned NU7 fork can scan, so a `derive-testnet-address.mjs`-style UFVK imports and renders balances.
 - Fresh context.
 
 - **Invalid key.** Navigate `<base>/?network=mainnet`, click `View-only`, fill the key textarea with `uitestview...not-a-key`, click `Import`. `.error` renders; still on `[aria-label="view-only import"]`.
@@ -34,4 +34,4 @@ Not implemented in run.mjs yet — hand-drive per SKILL.md *Drive* until added.
 - Without `ZCASH_VERIFY_UFVK` the valid-key leg CANNOT pass — report it as a skipped entry point with this unmet precondition, never as verified.
 - A viewonly wallet's fingerprint derives from the raw UFVK string; comparing it to the seed wallet's chip (fingerprint of the same account's UFVK) should MATCH when the keys are the same account — useful cross-check when both exist.
 - Import then reload boots into view-only again; the second-tab lease collision also applies (same OPFS file).
-- On testnet the NU7 NO-GO bites import exactly like create/restore: honest `SYNC_REQUIRED` is the pass.
+- On testnet the pinned NU7 fork scans, so import renders live balances like mainnet; a stuck `SYNC_REQUIRED` is a real fault.

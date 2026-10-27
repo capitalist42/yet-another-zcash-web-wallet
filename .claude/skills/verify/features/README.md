@@ -13,7 +13,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 ## Chain reality that shapes every journey
 
 - Mainnet (`https://zcash-mainnet.chainsafe.dev`): the full happy path must work — create/restore/import reach the wallet screen, live sync, balances, history.
-- Testnet (`https://zcash-testnet.chainsafe.dev`): public chain is NU7; the pinned SDK codec (`@zcashlabs/zcash.js@0.1.0-rc.5`) tops out at Nu6.3. Create/restore/import MUST end in the honest `.error` (`SYNC_REQUIRED` after one bounded retry). That IS the testnet pass condition. Never weaken a journey to make it pass; if a precondition is missing (funds, a funded UFVK), the journey reports failure and the reason goes in that feature's Gotchas.
+- Testnet (`https://zcash-testnet.chainsafe.dev`): public chain is NU7; the pinned SDK is a fork of `rc.5` that selects the NU7 branch at activation, so create/restore/import open, scan to tip, and complete exactly like mainnet. The wallet screen is the pass condition on both networks; a `SYNC_REQUIRED` on testnet is a real fault to investigate, not a premise to accept.
 
 ## Driving conventions
 

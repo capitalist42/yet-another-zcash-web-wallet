@@ -36,4 +36,5 @@ Not implemented in run.mjs yet — hand-drive per SKILL.md *Drive* until added.
 - A passphrase-protected phrase restored WITHOUT that optional passphrase derives a DIFFERENT wallet (different fingerprint) — don't mistake that for a bug, and don't cross-compare chips across passphrase mismatch.
 - Account index selects the ZIP-32 account; index 1 of an unused phrase restores an empty account — empty is not failure.
 - A fresh full scan from genesis on mainnet can take minutes for a real history; prefer a recent birthday height when the phrase's history start is known, and budget 240 s minimum.
-- Testnet restore must fail honestly (NU7 NO-GO). Same rule as create-wallet.
+- Testnet restore reaches the wallet screen like mainnet (pinned NU7 fork); an honest `SYNC_REQUIRED` now means a real fault.
+- Endpoint data fault (observed 2026-10-27, `zcash-testnet.chainsafe.dev`): a scan whose first fetched range STARTS in 4,539,064–~4,539,719 fails mid-scan (`Sync failed` pinned at 4,539,063; reloads re-fail deterministically — 6 reloads, zero console/page errors). Birthdays 4,539,720 and 4,539,748 scan clean to tip. Not an app bug; honest UI state. Workaround: choose a birthday at/above 4,539,720 when the wallet's history allows.

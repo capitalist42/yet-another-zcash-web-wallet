@@ -5,7 +5,7 @@ Create walks a user from the welcome screen through a forced backup gate into a 
 ## Sub-features
 
 - `create-gate` the backup gate shows exactly the generated 24 words and quizzes 3 random positions; only the matching words exit it.
-- `create-open` confirming the quiz opens the engine and boots the wallet screen (mainnet) or surfaces the honest `SYNC_REQUIRED` (testnet, while rc.5 < NU7).
+- `create-open` confirming the quiz opens the engine and boots the wallet screen on both networks (the pinned rc.5 fork selects the NU7 branch at testnet activation, so testnet creates scan to tip and complete).
 - `create-persist` reload in the same profile boots straight back into the same wallet (fingerprint chip identical).
 - `create-lease` a second tab on the same wallet renders the storage-busy screen.
 
@@ -20,14 +20,13 @@ Preconditions:
 
 - This run's preview passes `doctor.mjs` on its port; build fresh.
 - Fresh browser context (no registry rows).
-- mainnet leg: lightd mainnet green in doctor. testnet leg: expect the honest error, per chain reality.
+- mainnet leg: lightd mainnet green in doctor. testnet leg: lightd testnet green in doctor — the wallet screen is the pass condition on both.
 
 - **Welcome renders.** Navigate `<base>/?network=mainnet`, wait `[aria-label="welcome"]`. `main.app` has `data-network="mainnet"`. Snapshot `state-welcome.aria.yml`.
 - **Generate the phrase.** Click `Create a new Wallet`; `[aria-label="backup gate"]` appears (≤60 s — first WASM load). Assert `ol.phrase li` count 24; harvest words stripping the leading `N ` numbering. Snapshot `state-gate.aria.yml`.
 - **Wrong words rejected.** Fill each quiz input `[data-word-position="N"]` (3 of them) with a junk word; click `I saved my phrase`. `.error` appears, gate still on screen. Record the error string.
 - **Confirm the gate.** Fill each quiz input with `words[N - 1]` for its position; click `I saved my phrase`. Engine open begins (WASM + OPFS + bounded freshness): race `[aria-label="wallet"]` vs `.error` with a 240 s budget.
-- **Mainnet outcome = wallet screen.** `[aria-label="wallet"]` visible. The screen can appear before the account exists: wait until a fingerprint chip matches `^[a-z2-7]{4}$`, `[data-testid="receive-address"]` is a non-placeholder, and the Send button is enabled (≤120 s). Clicking Send opens `[aria-label="send"]` and Cancel closes it. History list or `No transactions yet.` present; sync line rendered. Snapshot `state-after-open.aria.yml` + `final.png`.
-- **Testnet outcome = honest failure with recovery.** `.error` carries the engine's sync failure — observed text: `Sync the wallet before continuing; retain any existing payment operation.` (the `SYNC_REQUIRED` code, rendered as its message) — inside the `[aria-label="sync retry"]` screen; no wallet screen. The screen explains nothing was created, shows the testnet/NU7 note, and offers `Try again`, `Switch to Mainnet`, `Back to my recovery phrase`. Clicking `Back to my recovery phrase` returns to `[aria-label="backup gate"]`. That string + those actions ARE the proof; snapshot them.
+- **Wallet screen on both networks.** `[aria-label="wallet"]` visible. The screen can appear before the account exists: wait until a fingerprint chip matches `^[a-z2-7]{4}$`, `[data-testid="receive-address"]` is a non-placeholder, and the Send button is enabled (≤120 s). Clicking Send opens `[aria-label="send"]` and Cancel closes it. History list or `No transactions yet.` present; sync line rendered. Snapshot `state-after-open.aria.yml` + `final.png`.
 - **Live, not decorative.** From the run's request log: ≥1 request to the configured lightd host, zero requests to any other http(s) host, zero failed responses (favicon probe excepted).
 - **Second tab collides.** Open a second page in the same context to the same URL: `[aria-label="storage busy"]` renders (≤30 s). Close it.
 - **Reload persistence.** Reload the first page: boots straight to `[aria-label="wallet"]` (≤120 s) with the SAME fingerprint chip as before the reload.
@@ -41,6 +40,6 @@ Implemented in `node .claude/skills/verify/scripts/run.mjs --port $PORT --featur
 - The quiz positions are random per attempt (`Math.random`), so never hardcode positions — read each input's `data-word-position` attribute and answer `words[pos - 1]`. Quiz comparison is case-insensitive and trims whitespace.
 - First create pays real download/sync cost (~70 MB assets + freshness pass): a 240 s budget is real, not flake; but >30 s on a RE-open signals a broken instance — doctor first.
 - `SYNC_REQUIRED` on mainnet can appear once under endpoint tip lag and self-heal via the single retry; only surface it if the wallet screen never arrives.
-- Testnet create passing the wallet screen would mean the NU7 NO-GO premise changed — fail the leg and update the map, don't silently accept.
+- A fresh testnet create CAN reach the wallet screen and scan to tip (pinned NU7 fork since f89f603). If it ends on `SYNC_REQUIRED` again, the pin regressed — fail the leg and check the fork's branch selection, don't paper over it.
 - The throwaway phrase is generated inside the run's ephemeral profile; never log it and never write it into evidence.
 - The gate's `.error` survives a rejected attempt on screen; the post-confirm outcome race must watch for a NEW error (text differs from the wrong-words one) or the wallet screen — matching the stale text reads an instant false-"error" on both networks.

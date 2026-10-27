@@ -17,13 +17,25 @@ Qualification run 2026-10-21 (headless Chromium via `node scripts/live.mjs
       worker as script) and one flow fix (bounded `syncFresh` + single
       `SYNC_REQUIRED` retry: `accounts.create` rejects until local chain
       state is coherent).
-- [x] **Testnet behaves as the NO-GO predicts**: open succeeds, the bounded
-      freshness pass cannot follow the NU7 tip (rc.5 codec stops at Nu6_3),
-      create surfaces `SYNC_REQUIRED` after the single retry — honest, no
-      silent corruption. Remove this line when the SDK ships NU7 support.
-- [ ] Restore from a funded seed and see real balances after scan (mainnet
+- [x] **Testnet create end-to-end (premise flipped 2026-10-27)**: the pinned
+      SDK fork selects the NU7 consensus branch at activation, so testnet
+      create opens, scans to tip and reaches the wallet screen like mainnet
+      (`Wallet synced · up to date`, zero page errors, only the app host +
+      `zcash-testnet.chainsafe.dev` contacted). Evidence:
+      `.claude/skills/verify/evidence/2026-10-27T10-59-06-777Z-create-wallet`.
+- [x] **Funded restore renders real balances on testnet**: restore of the
+      funded seed (payout `d9e066d8…f26e7f`, confirmed block 4,539,727,
+      1 009 637 zat) at birthday 4 539 720 scanned to tip and rendered
+      `0.01009637` ironwood; a same-session reload with the endpoint delayed
+      30 s painted the wallet screen (1 041 ms) and that balance (1 054 ms)
+      before ANY endpoint response landed — boot serves balances from the
+      local DB, sync starts after. Evidence:
+      `.claude/skills/verify/evidence/2026-10-27T12-12-34Z-funded-restore-boot-order`.
+
+- [ ] Restore from a funded seed and see real balances after scan (MAINNET
       funds required; also the Zashi cross-check below). Run via the
-      operator leg: scripts/restore-viewonly.mjs (see its section).
+      operator leg: scripts/restore-viewonly.mjs (see its section). The
+      testnet equivalent is green above.
 - [ ] View-only import of a UFVK belonging to a funded mainnet account:
       history and balances render, Send remains unavailable, no mint.
       Same operator leg (leg 2 derives the UFVK offline from the phrase).
@@ -31,8 +43,10 @@ Qualification run 2026-10-21 (headless Chromium via `node scripts/live.mjs
 ## Zashi cross-check (issue #4 AC)
 - [ ] Create in Zashi, restore the same phrase here (and vice versa):
       same account fingerprint and balances at the same birthday height.
-      No funded testnet seed available while the NO-GO stands; redo on
-      mainnet once the wallet is exposed there.
+      A funded testnet seed now EXISTS (gitignored `testnet-faucet.local`;
+      its restore + balance render is green above) — the cross-check itself
+      still needs a Zashi run. Redo on mainnet once the wallet is exposed
+      there.
 
 ## Browser surface (can run today)
 - [x] `npm run build && npm run preview` → root page: welcome screen renders,

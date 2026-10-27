@@ -62,7 +62,7 @@ for (const [net, url] of Object.entries(ENDPOINTS)) {
     const h = await lightdHeight(url);
     return `${url} @ height ${h.toLocaleString('en-US')}${
       net === 'testnet' && h > 4_465_026
-        ? ' (NU7 — rc.5 codec cannot follow; testnet create/restore will honestly fail SYNC_REQUIRED)'
+        ? ' (NU7 — pinned fork selects the NU7 branch; testnet legs must reach the wallet screen)'
         : ''
     }`;
   });
