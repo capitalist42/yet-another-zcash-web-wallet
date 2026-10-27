@@ -32,7 +32,8 @@ Not implemented in run.mjs yet — hand-drive per SKILL.md *Drive* until added.
 ## Gotchas
 
 - Restore with no funds still must reach the wallet screen on mainnet (empty balances/history are valid states; "No transactions yet." is a PASS, not a skip).
-- The passphrase field is `input[type=password]` inside `[aria-label="restore"]`; a passphrase-protected phrase restored WITHOUT it derives a DIFFERENT wallet (different fingerprint) — don't mistake that for a bug, and don't cross-compare chips across passphrase mismatch.
+- The passphrase field is the only `input[type=password]` inside `[aria-label="restore"]` (optional BIP-39 passphrase). There is no vault passphrase and no "how to keep this wallet" choice. The seed is stored encrypted on this device. After Auto-Lock, Unlock is a button on `[aria-label="unlock session"]` with the text `Stored encrypted on this device.` — it does not ask for a secret.
+- A passphrase-protected phrase restored WITHOUT that optional passphrase derives a DIFFERENT wallet (different fingerprint) — don't mistake that for a bug, and don't cross-compare chips across passphrase mismatch.
 - Account index selects the ZIP-32 account; index 1 of an unused phrase restores an empty account — empty is not failure.
 - A fresh full scan from genesis on mainnet can take minutes for a real history; prefer a recent birthday height when the phrase's history start is known, and budget 240 s minimum.
 - Testnet restore must fail honestly (NU7 NO-GO). Same rule as create-wallet.

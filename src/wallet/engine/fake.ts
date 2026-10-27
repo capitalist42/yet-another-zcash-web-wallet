@@ -394,12 +394,15 @@ export class FakeWallet implements EngineWallet {
   }
 
   /** txids whose wallet transaction is not readable yet: outputs answer as
-   * a single null placeholder (models the SDK's getTransaction lag behind a
-   * fresh block) until `resolveTransactions` enhances them. */
+   * a single null placeholder (enhancement lag) until `resolveTransactions`. */
   readonly pendingTxs = new Set<string>();
+  /** txids whose `getTransaction` is null: outputs answer as [] — the
+   * real unread shape that `[].every(...)` used to treat as classified. */
+  readonly missingTxs = new Set<string>();
 
   async listTransactionOutputs(txid: string): Promise<readonly EngineTransactionOutput[]> {
     this.check('listTransactionOutputs');
+    if (this.missingTxs.has(txid)) return [];
     if (this.pendingTxs.has(txid)) {
       return [{ address: null, value: null, isChange: null, sentFromThisWallet: false }];
     }
@@ -413,6 +416,7 @@ export class FakeWallet implements EngineWallet {
   /** Enhancement finished: what `addTransaction` recorded becomes readable. */
   resolveTransactions(txid: string): void {
     this.pendingTxs.delete(txid);
+    this.missingTxs.delete(txid);
   }
 
   /** Script a transaction landing on this account: the next getHistory and

@@ -31,6 +31,7 @@ Preconditions:
 - `confirm-send` spends real money once accepted — automated runs stop before it (same rule as `send`).
 - Testnet create stops at `SYNC_REQUIRED` on the rc.5 codec (see README chain reality), so the notes legs run on mainnet or once testnet unblocks; do not weaken a failed leg.
 - The operation-lock column is the SDK's inventory lock, not Exclude; a `held` row is still Excludable.
-- Excluding while a review is open re-arms the deviation guard at confirm time: Send refuses until the fresh deviation is accepted (`src/wallet/exclude.test.ts`, "a new exclusion while the review is open").
-- Accept is consent for the selection at accept time only: excluding a different note after accepting invalidates the accept at confirm time — Send refuses until a fresh accept (`src/wallet/exclude.test.ts`, "an exclusion added after accepting a deviation").
+- Excluding while a review is open updates the deviation flags immediately: Send stays refused until that deviation is accepted (`src/wallet/exclude.test.ts`, "refuses confirm when Exclude removes an input after review").
+- Accept covers the deviant inputs as they stand at accept time. Excluding another input of that plan withdraws the accept (`src/wallet/exclude.test.ts`, "withdraws accept when another input of the same plan is excluded").
+- A second Send tap while confirm is already awaiting broadcast does not send the held proposal twice.
 - Shielding (issue #8) does not assert Exclude: an excluded UTXO still shields. The Shield screen selects whole addresses rather than per-UTXO, and with `ALLOW_TRANSPARENT_SENDS = false` there is no send-path bypass. Known gap.

@@ -72,13 +72,13 @@ export interface SpendGuard {
   readonly reason?: 'view-only' | 'unavailable' | 'locked';
 }
 
-/** Onboarding custody choice (ADR-0002, issue #6): at create/restore the user
- * picks "Remember on this device (encrypted)" or "Never store". `vaultPassphrase`
- * is required when `remember` is true (the AES-GCM envelope key). */
-export interface RememberChoice {
-  readonly remember: boolean;
-  readonly vaultPassphrase?: string;
-}
+/** Onboarding custody (ADR-0002). Create picks a user-passphrase envelope or
+ * never storing the seed. Restore always uses `device`: AES-GCM on this
+ * device, no vault passphrase. */
+export type RememberChoice =
+  | { readonly kind: 'never' }
+  | { readonly kind: 'passphrase'; readonly vaultPassphrase: string }
+  | { readonly kind: 'device' };
 
 export interface SendDraftView {
   readonly recipient: string;
@@ -124,9 +124,11 @@ export type SendView =
       readonly draft: SendDraftView;
       readonly proposal: EngineProposal;
       readonly notice: SendNotice;
-      /** A chain input spends a note outside the non-excluded selection. */
+      /** A chain input spends a note outside the non-excluded selection.
+       * Tracks Exclude while this review is open. */
       readonly deviation: boolean;
-      /** The user accepted that real Proposal. Ignored when deviation is false. */
+      /** The user accepted the inputs that are outside the selection now.
+       * Ignored when deviation is false. */
       readonly accepted: boolean;
     }
   | { readonly phase: 'unlock'; readonly draft: SendDraftView; readonly notice: SendNotice }
@@ -229,6 +231,9 @@ export interface WalletApp {
   /** True when a Vault envelope exists for the open Wallet (Remember). False
    * for view-only and Never-store Wallets — Unlock uses the phrase path. */
   readonly hasVault: ReadableAtom<boolean>;
+  /** True when that envelope is the restore device key. Unlock confirms; it
+   * does not ask for a passphrase. */
+  readonly deviceVault: ReadableAtom<boolean>;
   /** Forced backup gate is open: a generated phrase awaits confirmation.
    * While true, every other onboarding path is refused (#4: not dismissable). */
   readonly backupPending: ReadableAtom<boolean>;
@@ -279,6 +284,8 @@ export interface WalletApp {
    * phrase (Never-store). On success, the signer is attached and the seed
    * mirror + idle deadline persist (Remember only). Never auto-decrypts. */
   unlock(passphrase: string): Promise<ImportResult>;
+  /** Unlock a device-stored restore wallet. No passphrase. */
+  unlockStored(): Promise<ImportResult>;
   /** App-wide Lock (#6): detach the signer, zeroize the mirror, set the Lock
    * flag. Viewing continues; both Networks and every open Wallet lose spend
    * authority. The flag survives reload until the next Unlock clears it. */
@@ -410,7 +417,10 @@ const savePendingSeed = (choice: RememberChoice, seed: { id: string; phrase: str
   try {
     globalThis.sessionStorage?.setItem(
       PENDING_SEED_KEY,
-      JSON.stringify({ ...seed, ...(choice.remember && choice.vaultPassphrase !== undefined ? { remember: true, vaultPassphrase: choice.vaultPassphrase } : {}) }),
+      JSON.stringify({
+        ...seed,
+        ...(choice.kind === 'passphrase' ? { remember: true, vaultPassphrase: choice.vaultPassphrase } : {}),
+      }),
     );
   } catch {
     // Reload can only finish creation when the tab can hold the phrase.
@@ -426,7 +436,9 @@ const readPendingSeed = (): PendingSeed | null => {
     return {
       id: parsed.id,
       phrase: parsed.phrase,
-      ...(parsed.remember === true && typeof parsed.vaultPassphrase === 'string' ? { remember: true, vaultPassphrase: parsed.vaultPassphrase } : {}),
+      ...(parsed.remember === true && typeof parsed.vaultPassphrase === 'string'
+        ? { remember: true as const, vaultPassphrase: parsed.vaultPassphrase }
+        : {}),
     };
   } catch {
     return null;
@@ -525,11 +537,6 @@ const noteKey = (note: NoteId): string => `${note.pool}:${note.txid}:${note.outp
 const sameNote = (a: NoteId, b: NoteId): boolean =>
   a.pool === b.pool && a.txid === b.txid && a.outputIndex === b.outputIndex;
 
-/** Accept consent binds to the selection snapshot at accept time: excluding
- * another input afterwards must not inherit the older accept (issue #9). */
-const sameSelectionSnapshot = (a: readonly NoteId[], b: readonly NoteId[]): boolean =>
-  a.length === b.length && a.every((x) => b.some((y) => sameNote(x, y)));
-
 /** Unspent notes the user has not Excluded. Transparent notes stay out while
  * transparent sends are off — the Send screen already refuses those inputs. */
 const allowedNoteKeys = (inventory: readonly EngineNote[], excludedIds: readonly NoteId[]): Set<string> => {
@@ -545,13 +552,26 @@ const allowedNoteKeys = (inventory: readonly EngineNote[], excludedIds: readonly
   return allowed;
 };
 
-/** True when a chain input spends a note outside the selection. The SDK has
- * no forced-inputs API, so this is the check instead of a selector argument.
- * A prior-step input has no note id and is not a user note. */
+/** Note keys of chain inputs outside the selection, sorted. A prior-step
+ * input has no note id and is not a user note. The SDK has no forced-inputs
+ * API, so this is the check instead of a selector argument. */
+const deviantNoteKeys = (proposal: EngineProposal, allowed: ReadonlySet<string>): readonly string[] => {
+  const keys: string[] = [];
+  for (const step of proposal.steps) {
+    for (const input of step.inputs) {
+      if (input.note !== undefined && !allowed.has(noteKey(input.note))) keys.push(noteKey(input.note));
+    }
+  }
+  keys.sort();
+  return keys;
+};
+
+const sameNoteKeys = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((key, index) => key === b[index]);
+
+/** True when a chain input spends a note outside the selection. */
 const proposalDeviates = (proposal: EngineProposal, allowed: ReadonlySet<string>): boolean =>
-  proposal.steps.some((step) =>
-    step.inputs.some((input) => input.note !== undefined && !allowed.has(noteKey(input.note))),
-  );
+  deviantNoteKeys(proposal, allowed).length > 0;
 
 export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const screen = atom<Screen>('booting');
@@ -592,6 +612,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   const unlocked = atom<boolean>(false);
   const unlockDeadline = atom<number | null>(null);
   const hasVault = atom<boolean>(false);
+  const deviceVault = atom<boolean>(false);
   /** Ms remaining until auto-Lock; recomputed every tick (countdown chip). */
   const autoLockInMs = atom<number | null>(null);
 
@@ -603,8 +624,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   /** Whether `held` spends outside the selection, and whether that was accepted. */
   let heldDeviation = false;
   let heldAccepted = false;
-  /** Selection snapshot the deviation accept consented to; null = none. */
-  let acceptedSelection: readonly NoteId[] | null = null;
+  /** Inventory the send review checked. Later Exclude edits are applied to this. */
+  let heldInventory: readonly EngineNote[] | null = null;
+  /** Deviant note keys the user accepted. A different set withdraws consent. */
+  let acceptedDeviantKeys: readonly string[] | null = null;
+  /** Filled in once the review view exists. Exclude calls it while a plan is held. */
+  let syncHeldSelection: () => void = () => {};
   /** A second confirm while the first awaits never reaches the engine. */
   let sendInFlight = false;
   let openSeq = 0;
@@ -627,7 +652,17 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   /** Id of a create that is on screen but not registered yet. */
   let pendingWalletId: string | null = null;
 
+  const clearHeldConsent = (): void => {
+    heldDeviation = false;
+    heldAccepted = false;
+    heldInventory = null;
+    acceptedDeviantKeys = null;
+  };
+
   const resetStores = (): void => {
+    // The sessionStorage seed mirror is not an atom. openWallet calls this
+    // before restoreSession reads that mirror, so clearing it here would lock
+    // every reload. Forget removes this Wallet's copy on its success path.
     walletInfo.set(null);
     balances.set(null);
     sync.set(null);
@@ -639,9 +674,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     canSpend.set(false);
     bootError.set(null);
     held = null;
-    heldDeviation = false;
-    heldAccepted = false;
-    acceptedSelection = null;
+    clearHeldConsent();
     excluded.set([]);
     notes.set([]);
     send.set({ phase: 'closed' });
@@ -649,6 +682,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     unlockDeadline.set(null);
     autoLockInMs.set(null);
     hasVault.set(false);
+    deviceVault.set(false);
   };
 
   const closeWallet = async (): Promise<void> => {
@@ -656,9 +690,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     stopAutoLock();
     const op = held?.operationId ?? null;
     held = null;
-    heldDeviation = false;
-    heldAccepted = false;
-    acceptedSelection = null;
+    clearHeldConsent();
     send.set({ phase: 'closed' });
     const w = wallet;
     wallet = null;
@@ -702,6 +734,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     if (info === null) return;
     excluded.set(next);
     notes.set(notes.get().map((row) => ({ ...row, excluded: next.some((id) => sameNote(id, row.id)) })));
+    // The note list stays mounted on review, so this write is the new selection.
+    syncHeldSelection();
     const rec = await deps.registry.get(info.id);
     if (rec === null) return;
     await deps.registry.add({ ...rec, excludedNotes: next });
@@ -726,21 +760,15 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     },
   };
 
-  /** Identified inputs outside the current unspent, non-excluded selection.
-   * Inventory failure fails closed: every identified input is a deviation. */
-  const selectionDeviates = async (
-    w: EngineWallet,
-    accountId: string,
-    proposal: EngineProposal,
-  ): Promise<boolean> => {
-    let inventory: readonly EngineNote[] = [];
+  /** Shielded notes plus transparent UTXOs. A failed read is an empty
+   * inventory, so every identified input is outside the selection. */
+  const readInventory = async (w: EngineWallet, accountId: string): Promise<readonly EngineNote[]> => {
     try {
       const [shielded, utxos] = await Promise.all([w.listNotes(accountId), w.listUtxos(accountId)]);
-      inventory = [...shielded, ...utxos];
+      return [...shielded, ...utxos];
     } catch {
-      inventory = [];
+      return [];
     }
-    return proposalDeviates(proposal, allowedNoteKeys(inventory, excluded.get()));
   };
 
   const refreshOperations = async (): Promise<void> => {
@@ -784,7 +812,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           continue;
         }
         const outputs = await w.listTransactionOutputs(entry.txid);
-        const complete = outputs.every((o) => o.address !== null && o.value !== null);
+        // Empty is unread, not classified: `[].every(...)` is vacuously true,
+        // and getTransaction is null until the local tx database catches up.
+        const complete = outputs.length > 0 && outputs.every((o) => o.address !== null && o.value !== null);
         let inboundHere = false;
         const credits: { address: string; value: bigint }[] = [];
         for (const o of outputs) {
@@ -1187,9 +1217,26 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       await restore(true); // storage intact (e.g. lease held elsewhere): row back, reopen
       return asResult(e);
     }
-    // Vault envelope for this Wallet is gone too (issue #6): nothing of the
-    // user's seed survives Forget. Already-gone is success.
+    // Vault envelope for this Wallet is gone too (issue #6). The decrypted
+    // mirror and a mid-create pending phrase are a second copy in
+    // sessionStorage. resetStores leaves them: openWallet calls it before
+    // restoreSession reads the mirror. A failed erase reopens and must still
+    // find this Wallet's mirror, so only the success path clears it. A copy
+    // for a different Wallet stays. Already-gone is success.
     await deps.vault.remove(info.id).catch(() => undefined);
+    const mirror = readMirror();
+    if (mirror !== null && mirror.id === info.id) clearMirror();
+    const pending = readPendingSeed();
+    if (pending !== null && pending.id === info.id) clearPendingSeed();
+    // The in-memory create phrase is the same seed. Drop it when this Wallet
+    // owns the in-flight create, or when no other Wallet's phrase is pending.
+    if (pending === null || pending.id === info.id) {
+      createPhrase = null;
+      pendingChoice = null;
+      if (pendingWalletId === info.id) pendingWalletId = null;
+      backupConfirmed = false;
+      backupPending.set(false);
+    }
     resetStores();
     screen.set('welcome');
     return { ok: true };
@@ -1329,9 +1376,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     // envelope re-store is idempotent.
     const storedChoice: RememberChoice | null =
       pending.remember === true && pending.vaultPassphrase !== undefined
-        ? { remember: true, vaultPassphrase: pending.vaultPassphrase }
+        ? { kind: 'passphrase', vaultPassphrase: pending.vaultPassphrase }
         : null;
-    const choice: RememberChoice = pendingChoice ?? storedChoice ?? { remember: await deps.vault.has(record.id) };
+    // No passphrase in this tab means we cannot re-key an envelope. A vault
+    // row that already exists is left as-is; this resume does not pretend
+    // the choice was Remember without the key.
+    const choice: RememberChoice = pendingChoice ?? storedChoice ?? { kind: 'never' };
     const bytes = phraseBytes(pending.phrase);
     traceSecret(bytes);
     try {
@@ -1351,8 +1401,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     unlockDeadline.set(null);
     autoLockInMs.set(null);
     hasVault.set(false);
+    deviceVault.set(false);
     if (record.kind !== 'seed') return; // view-only: no Unlock machinery
     hasVault.set(await deps.vault.has(record.id));
+    deviceVault.set(await deps.vault.deviceBound(record.id));
     const locked = readLockFlag();
     const mirror = readMirror();
     const now = Date.now();
@@ -1437,13 +1489,33 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     startAutoLock();
   };
 
-  /** Unlock via the Vault passphrase (Remember path). Decrypts the envelope,
-   * verifies the phrase by attaching the signer (the SDK checks it against
-   * the stored viewing key), mirrors the seed, and clears the Lock flag. */
+  const openFromPhrase = async (w: EngineWallet, accountId: string, infoId: string, phrase: string): Promise<ImportResult> => {
+    const bytes = phraseBytes(phrase);
+    traceSecret(bytes);
+    try {
+      await w.attachSigner({ accountId, mnemonic: bytes });
+      markUnlocked(infoId, phrase);
+      return { ok: true };
+    } catch (e) {
+      return asResult(e);
+    } finally {
+      zeroize(bytes);
+    }
+  };
+
+  /** Unlock via the Vault passphrase (create Remember path). Decrypts the
+   * envelope, verifies the phrase by attaching the signer (the SDK checks it
+   * against the stored viewing key), mirrors the seed, and clears the Lock flag. */
   const unlock = async (passphrase: string): Promise<ImportResult> => {
     const target = await unlockTarget();
     if (target === null) return { ok: false, code: 'UNKNOWN', message: 'no open seed Wallet' };
     const { w, info, account } = target;
+    if (await deps.vault.deviceBound(info.id))
+      return {
+        ok: false,
+        code: 'INVALID_ARGUMENT',
+        message: 'This wallet is stored on this device. Unlock does not take a passphrase.',
+      };
     let phrase: string;
     try {
       phrase = await deps.vault.load(info.id, passphrase);
@@ -1451,17 +1523,22 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       const code: VaultErrorCode = e instanceof VaultError ? e.code : 'UNKNOWN';
       return { ok: false, code, message: e instanceof Error ? e.message : String(e) };
     }
-    const bytes = phraseBytes(phrase);
-    traceSecret(bytes);
+    return openFromPhrase(w, account.id, info.id, phrase);
+  };
+
+  /** Unlock a restore wallet whose seed is encrypted on this device. */
+  const unlockStored = async (): Promise<ImportResult> => {
+    const target = await unlockTarget();
+    if (target === null) return { ok: false, code: 'UNKNOWN', message: 'no open seed Wallet' };
+    const { w, info, account } = target;
+    let phrase: string;
     try {
-      await w.attachSigner({ accountId: account.id, mnemonic: bytes });
-      markUnlocked(info.id, phrase);
-      return { ok: true };
+      phrase = await deps.vault.loadDevice(info.id);
     } catch (e) {
-      return asResult(e);
-    } finally {
-      zeroize(bytes);
+      const code: VaultErrorCode = e instanceof VaultError ? e.code : 'UNKNOWN';
+      return { ok: false, code, message: e instanceof Error ? e.message : String(e) };
     }
+    return openFromPhrase(w, account.id, info.id, phrase);
   };
 
   /** Unlock by re-entering the recovery phrase (Never-store path; no Vault
@@ -1501,12 +1578,14 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     traceSecret(bytes);
     try {
       await w.attachSigner({ accountId: account.id, mnemonic: bytes });
-      const remember = choice !== null && choice.remember && choice.vaultPassphrase !== undefined && choice.vaultPassphrase !== '';
-      if (remember && choice !== null && choice.vaultPassphrase !== undefined) {
-        await deps.vault.store(info.id, phrase, choice.vaultPassphrase);
-      }
-      hasVault.set(remember);
-      markUnlocked(info.id, remember ? phrase : null);
+      const device = choice?.kind === 'device';
+      const passphrase = choice?.kind === 'passphrase' && choice.vaultPassphrase !== '' ? choice.vaultPassphrase : null;
+      if (device) await deps.vault.storeDevice(info.id, phrase);
+      else if (passphrase !== null) await deps.vault.store(info.id, phrase, passphrase);
+      const stored = device || passphrase !== null;
+      hasVault.set(stored);
+      deviceVault.set(device);
+      markUnlocked(info.id, stored ? phrase : null);
     } catch {
       // best-effort: a failed attach after create leaves the wallet locked;
       // the user can Unlock with the passphrase (Remember) or phrase (Never).
@@ -1544,7 +1623,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         lastUsed: Date.now(),
         excludedNotes: prior?.excludedNotes ?? [],
       });
-      if (phrase !== '') savePendingSeed(choice ?? pendingChoice ?? { remember: false }, { id, phrase });
+      if (phrase !== '') savePendingSeed(choice ?? pendingChoice ?? { kind: 'never' }, { id, phrase });
       // A network switch that landed while open() was in flight owns the screen.
       const ownsScreen = seq === openSeq && (wallet === null || wallet === w);
       if (ownsScreen) {
@@ -1651,7 +1730,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     async confirmBackup(phrase: string, choice?: RememberChoice): Promise<ImportResult> {
       if (backupConfirmed) return { ok: true }; // idempotent double-tap
       if (createPhrase === null) return { ok: false, code: 'UNKNOWN', message: 'no phrase in flight' };
-      if (choice?.remember === true && (choice.vaultPassphrase === undefined || choice.vaultPassphrase === ''))
+      if (choice?.kind === 'passphrase' && choice.vaultPassphrase === '')
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Remember on this device requires a passphrase' };
       let normalized: string;
       try {
@@ -1662,7 +1741,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       if (normalized !== createPhrase) {
         return { ok: false, code: 'INVALID_MNEMONIC', message: 'phrase mismatch' };
       }
-      pendingChoice = choice ?? { remember: false };
+      pendingChoice = choice ?? { kind: 'never' };
       const bytes = phraseBytes(normalized);
       traceSecret(bytes);
       try {
@@ -1700,7 +1779,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Account index must be a whole number ≥ 0' };
       if (!validBirthday(args.birthday))
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Birthday height must be a whole number ≥ 1' };
-      if (args.custody?.remember === true && (args.custody.vaultPassphrase === undefined || args.custody.vaultPassphrase === ''))
+      if (args.custody?.kind === 'passphrase' && args.custody.vaultPassphrase === '')
         return { ok: false, code: 'INVALID_ARGUMENT', message: 'Remember on this device requires a passphrase' };
       let phrase: string;
       try {
@@ -1709,7 +1788,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         return { ok: false, code: 'INVALID_MNEMONIC', message: e instanceof Error ? e.message : String(e) };
       }
       const name = args.name ?? 'restored';
-      const choice: RememberChoice = args.custody ?? { remember: false };
+      const choice: RememberChoice = args.custody ?? { kind: 'device' };
       const bytes = phraseBytes(phrase);
       const pass = args.passphrase === undefined || args.passphrase === '' ? undefined : phraseBytes(args.passphrase);
       traceSecret(bytes);
@@ -1812,6 +1891,24 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     memo: view.draft.memo,
   });
 
+  // The note list stays mounted on review, so Exclude can move the selection
+  // after the first deviation flag was captured. Recompute from the inventory
+  // that review checked and the excluded set as it stands now.
+  syncHeldSelection = (): void => {
+    if (held === null || heldInventory === null) return;
+    const keys = deviantNoteKeys(held, allowedNoteKeys(heldInventory, excluded.get()));
+    const deviates = keys.length > 0;
+    const accepted =
+      heldAccepted && acceptedDeviantKeys !== null && sameNoteKeys(keys, acceptedDeviantKeys);
+    heldDeviation = deviates;
+    heldAccepted = accepted;
+    if (!accepted) acceptedDeviantKeys = null;
+    const view = send.get();
+    if (view.phase !== 'review') return;
+    if (view.deviation === deviates && view.accepted === accepted) return;
+    showReview(readDraft(view), held, view.notice);
+  };
+
   /** In-flight abandon. A new propose waits on this so input locks are free. */
   let releaseTail: Promise<void> = Promise.resolve();
   let releasesInFlight = 0;
@@ -1820,9 +1917,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     const op = held?.operationId ?? null;
     const current = wallet;
     held = null;
-    heldDeviation = false;
-    heldAccepted = false;
-    acceptedSelection = null;
+    clearHeldConsent();
     if (op === null || current === null) return releaseTail;
     const run = (): Promise<void> => {
       releasesInFlight += 1;
@@ -2004,8 +2099,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         // outside the selection), the review shows that real plan and confirm
         // waits for an explicit accept. Inventory is read after propose; if the
         // user left or edited the draft during that read, drop the plan instead
-        // of painting a review they already dismissed.
-        const deviates = await selectionDeviates(wallet, account.id, proposal);
+        // of painting a review they already dismissed. The note list stays up,
+        // so a later Exclude recomputes against this same inventory.
+        const inventory = await readInventory(wallet, account.id);
         if (held !== proposal) return;
         const current = send.get();
         if (current.phase !== 'form' && current.phase !== 'review') {
@@ -2021,9 +2117,10 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
           await releaseHeld();
           return;
         }
-        heldDeviation = deviates;
+        heldInventory = inventory;
+        heldDeviation = proposalDeviates(proposal, allowedNoteKeys(inventory, excluded.get()));
         heldAccepted = false;
-        acceptedSelection = null;
+        acceptedDeviantKeys = null;
         showReview(draft, proposal, null);
       } catch (error) {
         await routeEngine(error, draft, false);
@@ -2032,48 +2129,35 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     async confirm(): Promise<void> {
       const view = send.get();
       if (view.phase !== 'review' || held === null || wallet === null) return;
-      // A deviant plan is not consent. The user has to accept the real inputs.
-      if (view.deviation && !view.accepted) return;
-      // The re-check below awaits; a second tap past the guards would reach
-      // wallet.send with the same held proposal twice.
+      // wallet.send is the first await on the happy path. A second tap in
+      // that window would otherwise broadcast the same held proposal twice.
       if (sendInFlight) return;
       sendInFlight = true;
       try {
-        // The note browser stays live under review: a note Excluded after the
-        // review was painted lands this plan's input outside the selection.
-        // Re-assert against the current selection before broadcasting, so an
-        // Excluded note is never spent without a fresh explicit accept. The
-        // broadcast path fails closed: an inventory read error counts as
-        // deviation inside selectionDeviates.
-        const account = await defaultAccount(wallet);
-        if (account === undefined) return;
-        const w = wallet;
-        const plan = held;
-        const deviates = await selectionDeviates(w, account.id, plan);
-        // The user may have left review or released the plan during the read;
-        // never broadcast into a screen that moved on.
-        if (send.get() !== view || held !== plan) return;
-        // Consent covers only the selection as it stood at accept time.
-        const consented =
-          view.accepted &&
-          acceptedSelection !== null &&
-          sameSelectionSnapshot(acceptedSelection, excluded.get());
-        if (deviates && !consented) {
-          heldDeviation = true;
-          heldAccepted = false;
-          acceptedSelection = null;
-          send.set({ ...view, deviation: true, accepted: false });
+        // Notes stay on this screen, so the excluded set may have moved since
+        // review captured its flag. Broadcast only the plan that still matches
+        // the selection, or the inputs the user accepted for this set.
+        syncHeldSelection();
+        if (send.get().phase !== 'review' || held === null || heldInventory === null) return;
+        if (heldDeviation && !heldAccepted) return;
+        const draft = readDraft(view);
+        const guard = spendGuard();
+        if (!guard.ok) {
+          // Lock already dropped spend authority. Release the plan so its
+          // inputs are not stuck, and do not broadcast.
+          await releaseHeld();
+          showForm(
+            draft,
+            { kind: guard.reason === 'view-only' ? 'view-only' : guard.reason === 'locked' ? 'locked' : 'unavailable' },
+          );
           return;
         }
-        const draft = readDraft(view);
         // Broadcasting is a spend attempt → activity (issue #6).
         touchIdle();
         try {
-          const result = await wallet.send(plan.proposalId);
+          const result = await wallet.send(held.proposalId);
           held = null;
-          heldDeviation = false;
-          heldAccepted = false;
-          acceptedSelection = null;
+          clearHeldConsent();
           await refreshOperations();
           send.set({ phase: 'sent', txid: result.txid });
         } catch (error) {
@@ -2136,10 +2220,13 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     },
     acceptInputs(): void {
       const view = send.get();
-      if (view.phase !== 'review' || !view.deviation || view.accepted || held === null) return;
+      if (view.phase !== 'review' || !view.deviation || view.accepted || held === null || heldInventory === null) {
+        return;
+      }
+      const keys = deviantNoteKeys(held, allowedNoteKeys(heldInventory, excluded.get()));
+      if (keys.length === 0) return;
+      acceptedDeviantKeys = keys;
       heldAccepted = true;
-      // Consent covers the selection right now, nothing that changes later.
-      acceptedSelection = excluded.get();
       send.set({ ...view, accepted: true });
     },
   };
@@ -2438,6 +2525,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     unlockDeadline,
     autoLockInMs,
     hasVault,
+    deviceVault,
     backupPending,
     creating,
     bootError,
@@ -2455,6 +2543,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     onViewOnly,
     guardSpend: spendGuard,
     unlock,
+    unlockStored,
     lock,
     unlockWithPhrase,
     send,

@@ -70,6 +70,35 @@ describe('vault envelope', () => {
     expect(env!.iv).toHaveLength(12);
   });
 
+  it('a device envelope round-trips without a passphrase and hides the phrase', async () => {
+    await vault.storeDevice('w1', PHRASE);
+    expect(await vault.deviceBound('w1')).toBe(true);
+    expect(await vault.has('w1')).toBe(true);
+    expect(await vault.loadDevice('w1')).toBe(PHRASE);
+    const env = await store.get('w1');
+    expect(new TextDecoder().decode(env!.ciphertext)).not.toContain('abandon');
+    expect(new TextDecoder().decode(env!.deviceKey!)).not.toContain('abandon');
+  });
+
+  it('a user passphrase does not open a device envelope', async () => {
+    await vault.storeDevice('w1', PHRASE);
+    await expect(vault.load('w1', 'pw')).rejects.toMatchObject({ code: 'WRONG_PASSPHRASE' });
+  });
+
+  it('loadDevice refuses a user-passphrase envelope', async () => {
+    await vault.store('w1', PHRASE, 'pw');
+    expect(await vault.deviceBound('w1')).toBe(false);
+    await expect(vault.loadDevice('w1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('a later passphrase store replaces the device key', async () => {
+    await vault.storeDevice('w1', PHRASE);
+    await vault.store('w1', PHRASE, 'pw');
+    expect(await vault.deviceBound('w1')).toBe(false);
+    expect(await vault.load('w1', 'pw')).toBe(PHRASE);
+    await expect(vault.loadDevice('w1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
   it('PBKDF2 iteration count is 210k (ADR-0002 hard requirement)', async () => {
     // The envelope is opaque, but the derivation count is a public constant:
     // ADR-0002 pins it; a regression here is a security downgrade.

@@ -250,7 +250,9 @@ export interface EngineWallet {
    * Exposed Address list). Reads `addresses.list`; never burns an index. */
   listAddresses(accountId: string): Promise<readonly string[]>;
   /** Outputs of one transaction as this Wallet sees them, for receipt
-   * classification. Empty when the Wallet never observed the tx. */
+   * classification. A tx not yet in the local DB is unread: a
+   * null-field placeholder (adapter) or an empty list. Neither is
+   * fully classified — observeHistory must retry, not mark it observed. */
   listTransactionOutputs(txid: string): Promise<readonly EngineTransactionOutput[]>;
   getBalance(accountId: string): Promise<EngineBalance>;
   getHistory(accountId: string, limit?: number): Promise<readonly EngineHistoryEntry[]>;

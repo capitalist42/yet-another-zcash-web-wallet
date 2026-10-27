@@ -1,7 +1,10 @@
-// App-level seed Vault (ADR-0002): PBKDF2-SHA256 (210k, random salt) → AES-GCM-256
-// envelope in IndexedDB, user-chosen passphrase. The SDK's own OPFS store is
-// plaintext at rest but holds no spend authority; this envelope is the only
-// place a seed touches disk. "Never store" wallets simply have no envelope.
+// App-level seed Vault (ADR-0002): AES-GCM-256 envelope in IndexedDB. Create's
+// Remember path derives the key with PBKDF2-SHA256 (210k, random salt, user
+// passphrase). Restore's device path uses a random AES key kept in the same
+// record — this origin can decrypt it, and the user is not asked for a vault
+// passphrase. The SDK's own OPFS store is plaintext at rest but holds no spend
+// authority; this envelope is the only place a seed touches disk. "Never store"
+// wallets simply have no envelope.
 //
 // Security boundary (ADR-0002): the Vault guards the seed AT REST on a device,
 // not the unlocked session — once unlocked, the page is the boundary. The
@@ -31,6 +34,9 @@ export interface VaultEnvelope {
   readonly salt: Uint8Array<ArrayBuffer>;
   readonly iv: Uint8Array<ArrayBuffer>;
   readonly ciphertext: Uint8Array<ArrayBuffer>;
+  /** Restore only. The raw AES-GCM key lives in this record, so the origin can
+   * decrypt without a user passphrase. Absent on user-passphrase envelopes. */
+  readonly deviceKey?: Uint8Array<ArrayBuffer>;
 }
 
 /** Minimal KV surface so tests run against fake-indexeddb. */
@@ -44,13 +50,21 @@ export interface Vault {
   /** Encrypt `phrase` under `passphrase` and persist for wallet `id`. Re-store
    * overwrites (passphrase change path). */
   store(id: string, phrase: string, passphrase: string): Promise<void>;
+  /** Encrypt `phrase` under a fresh device key and persist both. Re-store
+   * overwrites. The key is not a user secret. */
+  storeDevice(id: string, phrase: string): Promise<void>;
   /** Decrypt the envelope for `id`; returns the phrase or throws
    * WRONG_PASSPHRASE / NOT_FOUND. The caller zeroizes the scratch bytes it
    * passes to attachSigner, but the returned string itself is immutable —
    * JS cannot zeroize it, so plaintext lingers in the heap until GC
    * (ADR-0002's stated honesty limit: process isolation is not a boundary). */
   load(id: string, passphrase: string): Promise<string>;
+  /** Decrypt a device-keyed envelope. NOT_FOUND when the record is missing
+   * or is a user-passphrase envelope. */
+  loadDevice(id: string): Promise<string>;
   has(id: string): Promise<boolean>;
+  /** True when the envelope is the restore device-key form. */
+  deviceBound(id: string): Promise<boolean>;
   remove(id: string): Promise<void>;
 }
 
@@ -77,6 +91,9 @@ const deriveKey = async (passphrase: string, salt: Uint8Array<ArrayBuffer>): Pro
   );
 };
 
+const importAes = async (raw: Uint8Array<ArrayBuffer>, usage: 'encrypt' | 'decrypt'): Promise<CryptoKey> =>
+  subtle().importKey('raw', raw, { name: 'AES-GCM' }, false, [usage]);
+
 export const createVault = (envelopeStore: VaultStore): Vault => ({
   async store(id, phrase, passphrase) {
     const salt = globalThis.crypto.getRandomValues(new Uint8Array(SALT_BYTES));
@@ -88,6 +105,14 @@ export const createVault = (envelopeStore: VaultStore): Vault => ({
       new TextEncoder().encode(phrase),
     );
     await envelopeStore.put(id, { salt, iv, ciphertext: new Uint8Array(ciphertext) });
+  },
+  async storeDevice(id, phrase) {
+    const deviceKey = globalThis.crypto.getRandomValues(new Uint8Array(KEY_BYTES));
+    const salt = globalThis.crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+    const iv = globalThis.crypto.getRandomValues(new Uint8Array(IV_BYTES));
+    const key = await importAes(deviceKey, 'encrypt');
+    const ciphertext = await subtle().encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(phrase));
+    await envelopeStore.put(id, { salt, iv, ciphertext: new Uint8Array(ciphertext), deviceKey });
   },
   async load(id, passphrase) {
     const env = await envelopeStore.get(id);
@@ -103,8 +128,24 @@ export const createVault = (envelopeStore: VaultStore): Vault => ({
       throw new VaultError('WRONG_PASSPHRASE', 'passphrase did not verify');
     }
   },
+  async loadDevice(id) {
+    const env = await envelopeStore.get(id);
+    if (env === null || env.deviceKey === undefined)
+      throw new VaultError('NOT_FOUND', `no device vault entry for ${id}`);
+    const key = await importAes(env.deviceKey, 'decrypt');
+    try {
+      const plaintext = await subtle().decrypt({ name: 'AES-GCM', iv: env.iv }, key, env.ciphertext);
+      return new TextDecoder().decode(plaintext);
+    } catch {
+      throw new VaultError('WRONG_PASSPHRASE', 'device key did not verify');
+    }
+  },
   async has(id) {
     return (await envelopeStore.get(id)) !== null;
+  },
+  async deviceBound(id) {
+    const env = await envelopeStore.get(id);
+    return env?.deviceKey !== undefined && env.deviceKey.byteLength === KEY_BYTES;
   },
   async remove(id) {
     await envelopeStore.remove(id);
@@ -120,6 +161,7 @@ const toStorable = (env: VaultEnvelope): Record<string, Uint8Array<ArrayBuffer>>
   salt: env.salt,
   iv: env.iv,
   ciphertext: env.ciphertext,
+  ...(env.deviceKey !== undefined ? { deviceKey: env.deviceKey } : {}),
 });
 
 // IndexedDB structured-clone hands back views over a plain ArrayBuffer.
@@ -127,6 +169,7 @@ const fromStorable = (row: Record<string, Uint8Array<ArrayBuffer>>): VaultEnvelo
   salt: row.salt,
   iv: row.iv,
   ciphertext: row.ciphertext,
+  ...(row.deviceKey !== undefined ? { deviceKey: row.deviceKey } : {}),
 });
 
 export const idbVaultStore = (): VaultStore => {

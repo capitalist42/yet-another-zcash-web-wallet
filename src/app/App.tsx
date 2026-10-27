@@ -547,14 +547,19 @@ function AutoLockChip() {
  * attach the signer — neither ever auto-decrypts at startup. */
 function UnlockPanel() {
   const hasVault = useStore(app.hasVault);
+  const deviceVault = useStore(app.deviceVault);
   const [secret, setSecret] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const submit = async (passphrasePath: boolean): Promise<void> => {
+  const submit = async (): Promise<void> => {
     setBusy(true);
     setError(null);
     try {
-      const res = passphrasePath ? await app.unlock(secret) : await app.unlockWithPhrase(secret);
+      const res = deviceVault
+        ? await app.unlockStored()
+        : hasVault
+          ? await app.unlock(secret)
+          : await app.unlockWithPhrase(secret);
       if (!res.ok) setError(errorText(res, 'unlock failed'));
     } finally {
       setBusy(false);
@@ -567,32 +572,36 @@ function UnlockPanel() {
         Viewing continues. Spend authority returns only after Unlock — and lapses
         again after 10 idle minutes (Auto-Lock).
       </p>
-      <label>
-        {hasVault ? 'Vault passphrase' : 'Recovery Phrase'}
-        {hasVault ? (
-          <input
-            type="password"
-            value={secret}
-            data-testid="unlock-secret"
-            autoComplete="off"
-            onChange={(e) => setSecret(e.target.value)}
-          />
-        ) : (
-          <textarea
-            rows={3}
-            value={secret}
-            data-testid="unlock-secret"
-            onChange={(e) => setSecret(e.target.value)}
-          />
-        )}
-      </label>
+      {deviceVault ? (
+        <p className="muted">Stored encrypted on this device.</p>
+      ) : (
+        <label>
+          {hasVault ? 'Vault passphrase' : 'Recovery Phrase'}
+          {hasVault ? (
+            <input
+              type="password"
+              value={secret}
+              data-testid="unlock-secret"
+              autoComplete="off"
+              onChange={(e) => setSecret(e.target.value)}
+            />
+          ) : (
+            <textarea
+              rows={3}
+              value={secret}
+              data-testid="unlock-secret"
+              onChange={(e) => setSecret(e.target.value)}
+            />
+          )}
+        </label>
+      )}
       {error !== null && <p className="error" data-testid="unlock-error">{error}</p>}
       <div className="choices">
         <button
           type="button"
-          disabled={busy || secret.length === 0}
+          disabled={busy || (!deviceVault && secret.length === 0)}
           data-testid="unlock-submit"
-          onClick={() => void submit(hasVault)}
+          onClick={() => void submit()}
         >
           {busy ? 'Unlocking…' : 'Unlock'}
         </button>
@@ -852,8 +861,9 @@ const quizPositions = (count: number, length = 24): number[] => {
 };
 
 // Custody choice (ADR-0002, issue #6): the Remember/Never-store decision plus
-// its Vault passphrase pair, shared verbatim by the create and restore flows.
-// Distinct from a BIP39 passphrase — this one keys the local envelope.
+// its Vault passphrase pair. Distinct from a BIP39 passphrase — this one keys
+// the local envelope. Restore does not use it: that flow always stores a
+// device-keyed envelope.
 const useCustody = (radioName: string) => {
   const [remember, setRemember] = useState(false);
   const [vaultPass, setVaultPass] = useState('');
@@ -925,7 +935,9 @@ const useCustody = (radioName: string) => {
     if (remember && vaultPass !== vaultPass2) {
       return { error: 'The two passphrases do not match.' };
     }
-    return { choice: { remember, ...(remember ? { vaultPassphrase: vaultPass } : {}) } };
+    return {
+      choice: remember ? { kind: 'passphrase', vaultPassphrase: vaultPass } : { kind: 'never' },
+    };
   };
   return { fields, validate };
 };
@@ -1030,9 +1042,36 @@ function RestoreFlow() {
   const [fullScan, setFullScan] = useState(true);
   const [height, setHeight] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const custody = useCustody('restore-custody');
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  // Paint "Restoring…" before engine.open. That open loads the runtime and
+  // does not return until the wallet exists, so starting it in the click
+  // leaves the button unchanged for the whole wait.
+  const start = (): void => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError(null);
+    window.setTimeout(() => {
+      void (async () => {
+        try {
+          const res = await app.onRestore.restore({
+            phrase,
+            passphrase,
+            accountIndex: Number(accountIndex),
+            birthday: birthdayChoice(fullScan, height),
+            custody: { kind: 'device' },
+          });
+          if (!res.ok) setError(errorText(res, 'restore failed'));
+        } finally {
+          busyRef.current = false;
+          setBusy(false);
+        }
+      })();
+    }, 0);
+  };
   return (
-    <section className="form" aria-label="restore">
+    <section className="form" aria-label="restore" aria-busy={busy}>
       <h2>Restore an existing Wallet</h2>
       <label>
         Recovery Phrase
@@ -1047,28 +1086,11 @@ function RestoreFlow() {
         <input value={accountIndex} onChange={(e) => setAccountIndex(e.target.value)} inputMode="numeric" />
       </label>
       <BirthdayFields fullScan={fullScan} height={height} onFullScan={setFullScan} onHeight={setHeight} />
-      {custody.fields}
+      <p className="muted">Stored encrypted on this device.</p>
+      {busy && <p className="muted">Restoring your Wallet…</p>}
       {error !== null && <p className="error">{error}</p>}
-      <button
-        type="button"
-        onClick={async () => {
-          const custodyResult = custody.validate();
-          if ('error' in custodyResult) {
-            setError(custodyResult.error);
-            return;
-          }
-          const choice = custodyResult.choice;
-          const res = await app.onRestore.restore({
-            phrase,
-            passphrase,
-            accountIndex: Number(accountIndex),
-            birthday: birthdayChoice(fullScan, height),
-            custody: choice,
-          });
-          setError(res.ok ? null : errorText(res, 'restore failed'));
-        }}
-      >
-        Restore
+      <button type="button" disabled={busy} onClick={start}>
+        {busy ? 'Restoring…' : 'Restore'}
       </button>
     </section>
   );
