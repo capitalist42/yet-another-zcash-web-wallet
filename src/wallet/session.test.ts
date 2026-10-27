@@ -339,7 +339,7 @@ describe('Forget drops the removed wallet seed from the tab', () => {
   it('Forget during a stuck create drops the in-memory phrase and the backup gate', async () => {
     engine.queueWallet({ createFailures: 2 });
     const created = await app.onCreate.generate();
-    const res = await app.onCreate.confirmBackup(created.phrase, { remember: true, vaultPassphrase: 'vaultpw' });
+    const res = await app.onCreate.confirmBackup(created.phrase, { kind: 'passphrase', vaultPassphrase: 'vaultpw' });
     expect(res).toMatchObject({ ok: false, code: 'SYNC_REQUIRED' });
     expect(app.backupPending.get()).toBe(true);
     expect(globalThis.sessionStorage?.getItem('yaw-pending-seed')).toContain(created.phrase);

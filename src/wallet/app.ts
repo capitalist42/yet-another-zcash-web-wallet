@@ -630,6 +630,8 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   let acceptedDeviantKeys: readonly string[] | null = null;
   /** Filled in once the review view exists. Exclude calls it while a plan is held. */
   let syncHeldSelection: () => void = () => {};
+  /** A second confirm while the first awaits never reaches the engine. */
+  let sendInFlight = false;
   let openSeq = 0;
   /** Screen to restore when the endpoint picker closes. */
   let endpointsReturn: Screen = 'settings';
@@ -2127,34 +2129,42 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     async confirm(): Promise<void> {
       const view = send.get();
       if (view.phase !== 'review' || held === null || wallet === null) return;
-      // Notes stay on this screen, so the excluded set may have moved since
-      // review captured its flag. Broadcast only the plan that still matches
-      // the selection, or the inputs the user accepted for this set.
-      syncHeldSelection();
-      if (send.get().phase !== 'review' || held === null || heldInventory === null) return;
-      if (heldDeviation && !heldAccepted) return;
-      const draft = readDraft(view);
-      const guard = spendGuard();
-      if (!guard.ok) {
-        // Lock already dropped spend authority. Release the plan so its
-        // inputs are not stuck, and do not broadcast.
-        await releaseHeld();
-        showForm(
-          draft,
-          { kind: guard.reason === 'view-only' ? 'view-only' : guard.reason === 'locked' ? 'locked' : 'unavailable' },
-        );
-        return;
-      }
-      // Broadcasting is a spend attempt → activity (issue #6).
-      touchIdle();
+      // wallet.send is the first await on the happy path. A second tap in
+      // that window would otherwise broadcast the same held proposal twice.
+      if (sendInFlight) return;
+      sendInFlight = true;
       try {
-        const result = await wallet.send(held.proposalId);
-        held = null;
-        clearHeldConsent();
-        await refreshOperations();
-        send.set({ phase: 'sent', txid: result.txid });
-      } catch (error) {
-        await routeEngine(error, draft, true);
+        // Notes stay on this screen, so the excluded set may have moved since
+        // review captured its flag. Broadcast only the plan that still matches
+        // the selection, or the inputs the user accepted for this set.
+        syncHeldSelection();
+        if (send.get().phase !== 'review' || held === null || heldInventory === null) return;
+        if (heldDeviation && !heldAccepted) return;
+        const draft = readDraft(view);
+        const guard = spendGuard();
+        if (!guard.ok) {
+          // Lock already dropped spend authority. Release the plan so its
+          // inputs are not stuck, and do not broadcast.
+          await releaseHeld();
+          showForm(
+            draft,
+            { kind: guard.reason === 'view-only' ? 'view-only' : guard.reason === 'locked' ? 'locked' : 'unavailable' },
+          );
+          return;
+        }
+        // Broadcasting is a spend attempt → activity (issue #6).
+        touchIdle();
+        try {
+          const result = await wallet.send(held.proposalId);
+          held = null;
+          clearHeldConsent();
+          await refreshOperations();
+          send.set({ phase: 'sent', txid: result.txid });
+        } catch (error) {
+          await routeEngine(error, draft, true);
+        }
+      } finally {
+        sendInFlight = false;
       }
     },
     async unlock(phrase: string): Promise<void> {

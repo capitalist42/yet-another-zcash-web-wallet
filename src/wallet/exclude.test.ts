@@ -296,4 +296,17 @@ describe('proposal input assertion', () => {
     await app.onSend.confirm();
     expect(wallet.sentProposalIds).toEqual(['prop-unlock']);
   });
+
+  it('a double confirm broadcasts the held proposal exactly once', async () => {
+    await seedNotes();
+    const wallet = engine.lastWallet();
+    wallet.queueProposal(spending('prop-twice', NOTE_B), 'bb-tx');
+    fill();
+    await app.onSend.review();
+    expect(app.send.get()).toMatchObject({ phase: 'review', deviation: false });
+    // wallet.send is the first await, so both taps pass the guards unless
+    // confirm latches (issue #9).
+    await Promise.all([app.onSend.confirm(), app.onSend.confirm()]);
+    expect(wallet.sentProposalIds).toEqual(['prop-twice']);
+  });
 });
