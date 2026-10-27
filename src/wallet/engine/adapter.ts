@@ -329,7 +329,12 @@ class AdapterWallet implements EngineWallet {
   async listTransactionOutputs(txid: string): Promise<readonly EngineTransactionOutput[]> {
     try {
       const tx = await this.client.getTransaction({ txid: txId(txid) });
-      if (tx === null) return [];
+      if (tx === null) {
+        // History can list a txid before the wallet transaction is local.
+        // An empty list looks fully classified to observeHistory
+        // (`[].every(...)` is true) and the inbound would never retry.
+        return [{ address: null, value: null, isChange: null, sentFromThisWallet: false }];
+      }
       // The WalletClient only sees this wallet DB, so any sender id here
       // belongs to one of OUR accounts: the wallet paid itself.
       return tx.outputs.map((o) => ({

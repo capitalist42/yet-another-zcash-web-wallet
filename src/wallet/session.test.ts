@@ -303,6 +303,72 @@ describe('app-wide Lock propagation (acceptance #2)', () => {
   });
 });
 
+describe('Forget drops the removed wallet seed from the tab', () => {
+  it('removes the plaintext mirror and pending phrase, and a later boot cannot resurrect them', async () => {
+    const phrase = await createRemember('vaultpw');
+    const id = (await registry.list('testnet'))[0]!.id;
+    expect(JSON.parse(globalThis.sessionStorage!.getItem('yaw-seed-mirror')!).phrase).toBe(phrase);
+    // A create that has not finished still holds the phrase beside the mirror.
+    globalThis.sessionStorage!.setItem(
+      'yaw-pending-seed',
+      JSON.stringify({ id, phrase, remember: true, vaultPassphrase: 'vaultpw' }),
+    );
+    const res = await app.removeWallet();
+    expect(res.ok).toBe(true);
+    expect(app.screen.get()).toBe('welcome');
+    expect(globalThis.sessionStorage?.getItem('yaw-seed-mirror')).toBeNull();
+    expect(globalThis.sessionStorage?.getItem('yaw-pending-seed')).toBeNull();
+    expect(await vault.has(id)).toBe(false);
+    await app.boot();
+    expect(app.screen.get()).toBe('welcome');
+    expect(app.unlocked.get()).toBe(false);
+    expect(globalThis.sessionStorage?.getItem('yaw-seed-mirror')).toBeNull();
+  });
+
+  it('a failed erase keeps the mirror so the reopened wallet stays unlocked', async () => {
+    await createRemember('vaultpw');
+    const phrase = JSON.parse(globalThis.sessionStorage!.getItem('yaw-seed-mirror')!).phrase as string;
+    engine.failNextRemove();
+    engine.queueWallet({ accounts: [{ id: 'acct-1' }] });
+    const res = await app.removeWallet();
+    expect(res.ok).toBe(false);
+    expect(JSON.parse(globalThis.sessionStorage!.getItem('yaw-seed-mirror')!).phrase).toBe(phrase);
+    expect(app.unlocked.get()).toBe(true);
+  });
+
+  it('Forget during a stuck create drops the in-memory phrase and the backup gate', async () => {
+    engine.queueWallet({ createFailures: 2 });
+    const created = await app.onCreate.generate();
+    const res = await app.onCreate.confirmBackup(created.phrase, { remember: true, vaultPassphrase: 'vaultpw' });
+    expect(res).toMatchObject({ ok: false, code: 'SYNC_REQUIRED' });
+    expect(app.backupPending.get()).toBe(true);
+    expect(globalThis.sessionStorage?.getItem('yaw-pending-seed')).toContain(created.phrase);
+    const removed = await app.removeWallet();
+    expect(removed.ok).toBe(true);
+    expect(app.backupPending.get()).toBe(false);
+    expect(globalThis.sessionStorage?.getItem('yaw-pending-seed')).toBeNull();
+    expect(globalThis.sessionStorage?.getItem('yaw-seed-mirror')).toBeNull();
+    const again = await app.onCreate.generate();
+    expect(again.phrase).not.toBe(created.phrase);
+  });
+
+  it('a seed mirror for a different wallet is left in place', async () => {
+    await createRemember('vaultpw');
+    globalThis.sessionStorage!.setItem(
+      'yaw-seed-mirror',
+      JSON.stringify({ id: 'other-wallet', phrase: FUNDED_PHRASE, deadline: nowMs + AUTO_LOCK_MS }),
+    );
+    globalThis.sessionStorage!.setItem(
+      'yaw-pending-seed',
+      JSON.stringify({ id: 'other-wallet', phrase: FUNDED_PHRASE }),
+    );
+    const res = await app.removeWallet();
+    expect(res.ok).toBe(true);
+    expect(JSON.parse(globalThis.sessionStorage!.getItem('yaw-seed-mirror')!).id).toBe('other-wallet');
+    expect(JSON.parse(globalThis.sessionStorage!.getItem('yaw-pending-seed')!).id).toBe('other-wallet');
+  });
+});
+
 describe('custody choice survives a reload mid-create', () => {
   it('resuming a Remember pending seed stores the envelope and unlocks', async () => {
     // A create that died before the account landed leaves the phrase in
