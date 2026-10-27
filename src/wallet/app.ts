@@ -609,6 +609,9 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   };
 
   const resetStores = (): void => {
+    // The sessionStorage seed mirror is not an atom. openWallet calls this
+    // before restoreSession reads that mirror, so clearing it here would lock
+    // every reload. Forget removes this Wallet's copy on its success path.
     walletInfo.set(null);
     balances.set(null);
     sync.set(null);
@@ -1074,9 +1077,26 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
       await restore(true); // storage intact (e.g. lease held elsewhere): row back, reopen
       return asResult(e);
     }
-    // Vault envelope for this Wallet is gone too (issue #6): nothing of the
-    // user's seed survives Forget. Already-gone is success.
+    // Vault envelope for this Wallet is gone too (issue #6). The decrypted
+    // mirror and a mid-create pending phrase are a second copy in
+    // sessionStorage. resetStores leaves them: openWallet calls it before
+    // restoreSession reads the mirror. A failed erase reopens and must still
+    // find this Wallet's mirror, so only the success path clears it. A copy
+    // for a different Wallet stays. Already-gone is success.
     await deps.vault.remove(info.id).catch(() => undefined);
+    const mirror = readMirror();
+    if (mirror !== null && mirror.id === info.id) clearMirror();
+    const pending = readPendingSeed();
+    if (pending !== null && pending.id === info.id) clearPendingSeed();
+    // The in-memory create phrase is the same seed. Drop it when this Wallet
+    // owns the in-flight create, or when no other Wallet's phrase is pending.
+    if (pending === null || pending.id === info.id) {
+      createPhrase = null;
+      pendingChoice = null;
+      if (pendingWalletId === info.id) pendingWalletId = null;
+      backupConfirmed = false;
+      backupPending.set(false);
+    }
     resetStores();
     screen.set('welcome');
     return { ok: true };
