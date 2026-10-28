@@ -17,12 +17,23 @@ Qualification run 2026-10-21 (headless Chromium via `node scripts/live.mjs
       worker as script) and one flow fix (bounded `syncFresh` + single
       `SYNC_REQUIRED` retry: `accounts.create` rejects until local chain
       state is coherent).
-- [x] **Testnet create end-to-end (premise flipped 2026-10-27)**: the pinned
-      SDK fork selects the NU7 consensus branch at activation, so testnet
-      create opens, scans to tip and reaches the wallet screen like mainnet
-      (`Wallet synced · up to date`, zero page errors, only the app host +
-      `zcash-testnet.chainsafe.dev` contacted). Evidence:
-      `.claude/skills/verify/evidence/2026-10-27T10-59-06-777Z-create-wallet`.
+- [x] **Testnet create end-to-end (premise flipped 2026-10-27; dead-scan heal
+      fixed same day)**: the pinned SDK fork selects the NU7 consensus branch
+      at activation, so testnet create opens, scans to tip and reaches the
+      wallet screen like mainnet. An endpoint blip that kills the scan
+      (`Sync failed`, watch stream finished, zero traffic — reproduced 2/2
+      with a manual reload required) is now healed without a reload: the poll
+      loop re-arms on a `failed`/`stopped` status and the watch loop re-arms
+      when its stream ends (fresh `watchSync` subscription, 15 s cooldown;
+      `app.boot.test.ts` covers all three paths). Live: repeated mid-scan
+      endpoint failures self-healed to `Wallet synced · up to date` in ~2 min
+      and stayed healthy across eight new blocks (one transient
+      `Syncing wallet` rescan per block, never `Sync failed` again), zero
+      console errors, only the app host + `zcash-testnet.chainsafe.dev`
+      contacted. Evidence:
+      `.claude/skills/verify/evidence/2026-10-27T15-19-52-190Z-create-wallet-heal2`
+      (bug repro pre-fix: `2026-10-27T13-02-18-232Z-create-wallet-playwright-cli`,
+      `…-repro2`).
 - [x] **Funded restore renders real balances on testnet**: restore of the
       funded seed (payout `d9e066d8…f26e7f`, confirmed block 4,539,727,
       1 009 637 zat) at birthday 4 539 720 scanned to tip and rendered

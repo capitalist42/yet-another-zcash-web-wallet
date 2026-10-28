@@ -1,7 +1,7 @@
 // Boot choreography (issue #3): registry → open last-used Wallet → await
 // startup recovery → balances from local DB → start sync. All through the
 // engine port on the scriptable fake.
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
 import { createRegistry, idbRegistryStore, type Registry, type WalletRecord } from './registry';
@@ -12,6 +12,7 @@ import { EXPLORER_PREF_KEY, LIGHTWALLETD_PREF_KEY } from './endpoints';
 import { overallProgress } from './sync-progress';
 import { createVault, idbVaultStore } from './vault';
 import { syncAt, until } from './test-helpers';
+import type { EngineSyncStatus } from './engine/port';
 
 // A valid test vector phrase (all-zero entropy) for the restore race case.
 const FUNDED_PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -238,6 +239,80 @@ describe('boot choreography', () => {
     const view = app.syncProgress.get();
     expect(view).toMatchObject({ scanned: 1_500_000, target: 1_500_000, targetReached: true, birthday: 1_000_000 });
     expect(overallProgress(view!, view!.birthday).percent).toBe(100);
+  });
+
+  it('a dead scan is healed without a reload: fresh subscription, live bar again', async () => {
+    // Live repro 2026-10-27: after create, the bounded freshness pass died and
+    // the SDK finished every watchSync subscriber — the bar sat at "Sync
+    // failed" forever. Kicking startSync on the dead arm is not enough; the
+    // poll loop must re-arm a NEW watch stream and the store must recover.
+    await registry.add(row({ id: 'a' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-1', birthdayHeight: 1_000_000 }] });
+    await app.boot();
+    const w = engine.lastWallet();
+    const failed = (scanned: number): EngineSyncStatus => ({
+      activity: 'failed',
+      scanned,
+      target: 1_500_000,
+      targetReached: false,
+      scanComplete: null,
+    });
+    w.polled.push(failed(1_200_000), syncAt(1_300_000, 1_500_000));
+    await until(app.sync, (s) => s?.activity === 'failed');
+    // The heal re-arms: a SECOND watchSync (the first one is dead in the real
+    // SDK) plus a scan restart, not just another kick.
+    expect(w.calls.filter((c) => c === 'watchSync')).toHaveLength(2);
+    expect(w.calls.filter((c) => c === 'startSync')).toHaveLength(2);
+    const healed = until(app.sync, (s) => s?.targetReached === true);
+    w.pushSync(syncAt(1_500_000, 1_500_000, true));
+    await healed;
+  });
+
+  it('back-to-back failed polls heal once (cooldown), not once per poll', async () => {
+    await registry.add(row({ id: 'a' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-1', birthdayHeight: 1_000_000 }] });
+    await app.boot();
+    const w = engine.lastWallet();
+    const failed = (scanned: number): EngineSyncStatus => ({
+      activity: 'failed',
+      scanned,
+      target: 1_500_000,
+      targetReached: false,
+      scanComplete: null,
+    });
+    // First failed poll heals; the second lands within the cooldown and must
+    // NOT spawn another arm (an endpoint failing instantly would otherwise
+    // restart the scan every poll tick forever).
+    w.polled.push(failed(100), failed(200));
+    await until(app.sync, (s) => s?.scanned === 200);
+    expect(w.calls.filter((c) => c === 'watchSync')).toHaveLength(2);
+    expect(w.calls.filter((c) => c === 'startSync')).toHaveLength(2);
+  });
+
+  it('a watch stream that ends after the tip is re-armed: the bar stays live', async () => {
+    // Live repro 2026-10-27: the wallet reached "up to date", then the SDK
+    // finished every watchSync subscriber on its next failed scan pass. The
+    // poll loop had already retired at the tip, so nothing detected the death
+    // and the widget froze at "Sync failed — / —" with no traffic. Stream
+    // end IS the death signal: the watch loop must re-arm on its own.
+    await registry.add(row({ id: 'a' }));
+    engine.queueWallet({ accounts: [{ id: 'acct-1', birthdayHeight: 1_000_000 }] });
+    await app.boot();
+    const w = engine.lastWallet();
+    w.polled.push(syncAt(1_500_000, 1_500_000, true));
+    await until(app.sync, (s) => s?.targetReached === true);
+    // The scan pass dies: every subscriber is finished (fake: stream ends).
+    w.watchers[0]!.close();
+    await vi.waitFor(() => expect(w.watchers).toHaveLength(2)); // re-arm rides microtasks
+    expect(w.watchers).toHaveLength(2); // a FRESH stream, not a kick on the dead one
+    expect(w.calls.filter((c) => c === 'watchSync')).toHaveLength(2);
+    expect(w.calls.filter((c) => c === 'startSync')).toHaveLength(2);
+    // The new stream drives the store again: failed → running → tip, no reload.
+    w.watchers[1]!.push({ activity: 'failed', scanned: 1_400_000, target: 1_500_000, targetReached: false, scanComplete: null });
+    await until(app.sync, (s) => s?.activity === 'failed');
+    const recovered = until(app.sync, (s) => s?.targetReached === true);
+    w.watchers[1]!.push(syncAt(1_500_000, 1_500_000, true));
+    await recovered;
   });
 
   it('non-terminal operations light the Pending Payments chip', async () => {

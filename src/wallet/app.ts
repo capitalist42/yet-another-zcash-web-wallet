@@ -365,6 +365,10 @@ const validBirthday = (b: RestoreBirthday): boolean =>
  * the watch stream only publishes on scan-revision commits). */
 const SYNC_POLL_MS = 1_500;
 
+/** Minimum spacing between dead-scan heal re-arms: an endpoint failing
+ * instantly must not turn the poll loop into a tight scan-attempt loop. */
+const SYNC_HEAL_COOLDOWN_MS = 15_000;
+
 const delay = (ms: number): Promise<void> => {
   const { promise, resolve } = Promise.withResolvers<void>();
   setTimeout(resolve, ms);
@@ -643,6 +647,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
   let pendingChoice: RememberChoice | null = null;
   /** Client whose sync stream is already subscribed. */
   let syncArmed: EngineWallet | null = null;
+  /** Monotonic arm generation: loops from a superseded arm exit when the
+   * sync is re-armed (e.g. the dead-scan self-heal). */
+  let syncGen = 0;
+  /** Wall-clock of the last dead-scan heal; bounds restart storms when the
+   * endpoint fails instantly. */
+  let lastSyncHealAt = 0;
   /** ADR-0004 rotation state, one lifetime per open (finishOpen re-seeds it;
    * the open is the only way it is ever entered): txids already classified —
    * so one landing transfer advances the display
@@ -850,11 +860,29 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     }
   };
 
-  /** Watch the sync stream; refresh displayed state per progress tick. */
-  const watchLoop = async (w: EngineWallet): Promise<void> => {
+  /** Begin a fresh watch/poll subscription set for `w` on a new generation.
+   * A dead scan needs a NEW `watchSync()` subscription — the SDK finishes
+   * every subscriber when a scan dies with a non-retryable error, so a bare
+   * `startSync()` on the dead arm would resurrect the scan with nobody
+   * listening. The superseded loops retire on their next generation check. */
+  const armFreshSync = async (w: EngineWallet): Promise<void> => {
+    syncArmed = w;
+    syncGen += 1;
+    const gen = syncGen;
+    void watchLoop(w, gen);
+    void pollLoop(w, gen);
+    await w.startSync();
+  };
+
+  /** Watch the sync stream; refresh displayed state per progress tick. The
+   * SDK finishes EVERY subscriber when a scan dies with a non-retryable
+   * error, so the stream ending while this arm is still current IS the
+   * death signal — heal here; the poll loop retires at the tip and could
+   * never see a death after it. */
+  const watchLoop = async (w: EngineWallet, gen: number): Promise<void> => {
     try {
       for await (const status of w.watchSync()) {
-        if (wallet !== w) break;
+        if (wallet !== w || gen !== syncGen) break;
         sync.set(status);
         if (status.targetReached) continueCreateAfterTip();
         await refreshOperations();
@@ -875,7 +903,17 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
         }
       }
     } catch {
-      // closed or superseded; the next open owns the stores now
+      // stream error: the same re-arm below owns the recovery
+    }
+    if (wallet !== w || gen !== syncGen) return; // closed/superseded; next open owns the stores
+    try {
+      const wait = lastSyncHealAt + SYNC_HEAL_COOLDOWN_MS - Date.now();
+      if (wait > 0) await delay(wait);
+      if (wallet !== w || gen !== syncGen) return; // closed during the cooldown
+      lastSyncHealAt = Date.now();
+      await armFreshSync(w);
+    } catch {
+      // engine closed mid-re-arm; the next open owns the stores
     }
   };
 
@@ -883,15 +921,25 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
    * on scan-revision commits (spike §Sync), so without this poll the bar would
    * sit at "—" for minutes on a long scan. Owns only the sync store: balances
    * and operations stay on the watch stream. Stops at the tip; a failed read
-   * is not fatal (the next tick retries). */
-  const pollLoop = async (w: EngineWallet): Promise<void> => {
+   * is not fatal (the next tick retries). A DEAD scan ('failed'/'stopped' —
+   * e.g. the freshness sync's abort timer racing the create, or an endpoint
+   * blip) is not fatal either: the next tick RESTARTS it, or the bar sits at
+   * "Sync failed" forever (create completes, scan never runs until reload). */
+  const pollLoop = async (w: EngineWallet, gen: number): Promise<void> => {
     for (;;) {
-      if (wallet !== w || sync.get()?.targetReached === true) return;
+      if (wallet !== w || gen !== syncGen || sync.get()?.targetReached === true) return;
       try {
         const status = await w.syncStatus();
-        if (wallet !== w) return;
+        if (wallet !== w || gen !== syncGen) return;
         if (!sameSync(sync.get(), status)) sync.set(status);
         if (status.targetReached) continueCreateAfterTip();
+        if (status.activity === 'failed' || status.activity === 'stopped') {
+          const now = Date.now();
+          if (now - lastSyncHealAt >= SYNC_HEAL_COOLDOWN_MS) {
+            lastSyncHealAt = now;
+            await armFreshSync(w); // retires THIS loop on the next gen check
+          }
+        }
       } catch {
         // transient engine read; retry on the next tick
       }
@@ -997,12 +1045,7 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     // Subscribe BEFORE triggering sync: the SDK stream only publishes on
     // scan-revision changes, so ticks fired between start and subscribe
     // would be lost (spike §Sync). A create already armed this client.
-    if (syncArmed !== w) {
-      syncArmed = w;
-      void watchLoop(w);
-      void pollLoop(w);
-      await w.startSync();
-    }
+    if (syncArmed !== w) await armFreshSync(w);
     await deps.registry.touch(record.id);
     if (!keepScreen) screen.set('wallet');
     // Session/Lock boot check (issue #6): the ONLY unlock guarantee. A valid
@@ -1328,12 +1371,12 @@ export const createWalletApp = (deps: WalletAppDeps): WalletApp => {
     screen.set('wallet');
   };
 
+  /** Arm the watch/poll loops and kick the scan. The failed-scan self-heal
+   * re-arms the same client on a fresh generation, so superseded loops can
+   * retire instead of refreshing stores beside their replacement. */
   const armSync = async (w: EngineWallet, restart = false): Promise<void> => {
     if (syncArmed !== w) {
-      syncArmed = w;
-      void watchLoop(w);
-      void pollLoop(w);
-      await w.startSync();
+      await armFreshSync(w);
       return;
     }
     if (restart) await w.startSync();

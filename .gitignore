@@ -4,3 +4,5 @@ dist
 *.local
 # spike hang-proxy marker (vite.config.ts toggleMiddleware; doctor warns on it)
 drill/
+# Playwright CLI output (may contain credentials)
+.playwright-cli/
